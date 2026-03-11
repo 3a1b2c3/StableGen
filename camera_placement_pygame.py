@@ -64,13 +64,51 @@ def _dirs_greedy(normals, areas):
 def _dirs_visibility(normals, areas):
     return visibility_weighted_directions(normals, areas, k=N_CAMS)
 
+def _dirs_box(normals, areas):
+    """6 axis-aligned directions (+X -X +Y -Y +Z -Z) — cube / cross rig."""
+    return np.array([
+        [ 1, 0, 0], [-1, 0, 0],
+        [ 0, 1, 0], [ 0,-1, 0],
+        [ 0, 0, 1], [ 0, 0,-1],
+    ], dtype=float)
+
+def _dirs_dome(normals, areas):
+    """Upper hemisphere only (elevation 0°–90°), Fibonacci-distributed."""
+    pts = np.array(fibonacci_sphere_points(N_CAMS * 2))
+    return pts[pts[:, 1] >= 0][:N_CAMS]
+
+def _dirs_multi_ring(normals, areas):
+    """Three parallel rings at -30°, 0°, +45° — photogrammetry bracket rig."""
+    rings = [
+        orbit_ring_directions(max(N_CAMS // 3, 1), elevation_deg=-30.0),
+        orbit_ring_directions(max(N_CAMS // 3, 1), elevation_deg=  0.0),
+        orbit_ring_directions(max(N_CAMS // 3, 1), elevation_deg= 45.0),
+    ]
+    return np.vstack(rings)
+
+def _dirs_icosphere(normals, areas):
+    """20 directions at icosahedron vertices — maximally uniform for exactly 12 or 20 cams."""
+    phi = (1 + math.sqrt(5)) / 2
+    verts = np.array([
+        [-1,  phi, 0], [ 1,  phi, 0], [-1, -phi, 0], [ 1, -phi, 0],
+        [ 0, -1,  phi], [ 0,  1,  phi], [ 0, -1, -phi], [ 0,  1, -phi],
+        [ phi, 0, -1], [ phi, 0,  1], [-phi, 0, -1], [-phi, 0,  1],
+    ], dtype=float)
+    verts /= np.linalg.norm(verts[0])
+    return verts[:N_CAMS] if N_CAMS <= len(verts) else np.vstack(
+        [verts, np.array(fibonacci_sphere_points(N_CAMS - len(verts)))])
+
 MODES = [
-    ("Fibonacci",   _dirs_fibonacci),
-    ("Orbit Ring",  _dirs_orbit),
-    ("Fan Arc",     _dirs_fan),
-    ("K-means",     _dirs_kmeans),
-    ("Greedy",      _dirs_greedy),
-    ("Vis-Weighted",_dirs_visibility),
+    ("Fibonacci",    _dirs_fibonacci),
+    ("Orbit Ring",   _dirs_orbit),
+    ("Fan Arc",      _dirs_fan),
+    ("K-means",      _dirs_kmeans),
+    ("Greedy",       _dirs_greedy),
+    ("Vis-Weighted", _dirs_visibility),
+    ("Box/Cross",    _dirs_box),
+    ("Dome",         _dirs_dome),
+    ("Multi-Ring",   _dirs_multi_ring),
+    ("Icosphere",    _dirs_icosphere),
 ]
 
 
