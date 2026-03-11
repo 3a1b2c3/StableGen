@@ -200,6 +200,8 @@ def main():
     parser.add_argument("obj",  help="Path to OBJ file")
     parser.add_argument("mode", type=int, choices=range(1, 8), metavar="MODE",
                         help="Strategy 1-7")
+    parser.add_argument("--gui", action="store_true",
+                        help="Open pygame visualizer instead of printing output")
     parser.add_argument("--cameras",   type=int,   default=20,   metavar="N",
                         help="Number of cameras / K  (default: 20)")
     parser.add_argument("--coverage",  type=float, default=0.95, metavar="F",
@@ -222,6 +224,14 @@ def main():
     if not os.path.isfile(args.obj):
         print(f"File not found: {args.obj}", file=sys.stderr)
         sys.exit(1)
+
+    # Launch pygame GUI — pass OBJ path and pre-select the strategy
+    if args.gui:
+        import subprocess
+        subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__),
+                        "camera_placement_pygame.py"), args.obj,
+                        "--strategy", str(args.mode)])
+        return
 
     print(f"Loading {args.obj} ...", file=sys.stderr)
     try:

@@ -5,6 +5,7 @@ Run: python camera_placement_gui.py
 
 import math
 import os
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -394,6 +395,20 @@ btn_regen.on_clicked(on_regen)
 btn_obj.on_clicked(on_load_obj)
 
 # ── Initial draw ───────────────────────────────────────────────────────────────
+
+# Load OBJ from command line if provided: python camera_placement_gui.py model.obj
+if len(sys.argv) > 1:
+    _path = sys.argv[1]
+    if os.path.isfile(_path):
+        try:
+            _n, _a, _v = load_obj(_path)
+            _name = os.path.basename(_path)
+            _mesh_cache[_name] = (_n, _a, _v)
+            state["mesh"] = _name
+        except Exception as _e:
+            print(f"Could not load {_path}: {_e}", file=sys.stderr)
+    else:
+        print(f"File not found: {_path}", file=sys.stderr)
 
 redraw()
 plt.show()
