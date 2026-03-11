@@ -129,6 +129,97 @@ def greedy_coverage_directions(normals, areas, max_cameras=12,
     return selected, final_coverage
 
 
+def orbit_ring_directions(n, elevation_deg=30.0, start_angle_deg=0.0):
+    """Place *n* cameras evenly around the Z axis at a fixed elevation.
+    Equivalent to Blender's Orbit Ring strategy.
+
+    Parameters
+    ----------
+    n               : number of cameras
+    elevation_deg   : camera elevation above the XY plane (-90..90)
+    start_angle_deg : azimuth of the first camera (degrees)
+
+    Returns (n, 3) numpy array of unit direction vectors pointing
+    *toward* the origin (i.e. the camera looks inward).
+    """
+    el = math.radians(elevation_deg)
+    dirs = []
+    for i in range(n):
+        az = math.radians(start_angle_deg + 360.0 * i / n)
+        x = math.cos(el) * math.cos(az)
+        y = math.cos(el) * math.sin(az)
+        z = math.sin(el)
+        dirs.append([x, y, z])
+    return np.array(dirs)
+
+
+def fan_arc_directions(n, forward=(1.0, 0.0, 0.0), fan_angle_deg=90.0,
+                       elevation_deg=0.0):
+    """Spread *n* cameras in an arc centred on *forward* within *fan_angle_deg*.
+    Equivalent to Blender's Fan Arc strategy.
+
+    Parameters
+    ----------
+    n               : number of cameras
+    forward         : (x, y, z) reference/centre direction of the arc
+    fan_angle_deg   : total angular width of the arc (degrees)
+    elevation_deg   : tilt all cameras up/down from the horizontal plane
+
+    Returns (n, 3) numpy array of unit direction vectors.
+    """
+    fwd = np.asarray(forward, dtype=float)
+    fwd /= np.linalg.norm(fwd) + 1e-12
+
+    # Build a right-vector perpendicular to fwd in the XY plane
+    up = np.array([0.0, 0.0, 1.0])
+    right = np.cross(fwd, up)
+    if np.linalg.norm(right) < 1e-6:          # fwd is nearly vertical
+        right = np.array([1.0, 0.0, 0.0])
+    right /= np.linalg.norm(right)
+
+    fan_rad = math.radians(fan_angle_deg)
+    el_rad  = math.radians(elevation_deg)
+
+    dirs = []
+    for i in range(n):
+        t = (i / max(n - 1, 1)) - 0.5        # -0.5 .. +0.5
+        az = t * fan_rad
+        # Rotate fwd around up by az, then tilt by elevation
+        d = fwd * math.cos(az) + right * math.sin(az)
+        d = d * math.cos(el_rad) + up * math.sin(el_rad)
+        d /= np.linalg.norm(d) + 1e-12
+        dirs.append(d)
+    return np.array(dirs)
+
+
+def visibility_weighted_directions(normals, areas, k, n_candidates=200,
+                                   balance=0.5):
+    """K-means placement weighted by per-face back-face visibility count.
+    Approximates Blender's Interactive Visibility-Weighted strategy
+    (back-face culling only — no BVH ray occlusion).
+
+    Parameters
+    ----------
+    normals      : (N, 3) unit face normals
+    areas        : (N,) face areas
+    k            : number of cameras
+    n_candidates : sphere samples used to estimate visibility fraction
+    balance      : 0.0 = full vis-weighting, 1.0 = uniform (area only)
+
+    Returns (k, 3) numpy array of cluster-centre unit vectors.
+    """
+    candidates = np.array(fibonacci_sphere_points(n_candidates))
+    # vis_count[i] = number of candidate directions that see face i
+    vis_count = (normals @ candidates.T > 0.26).sum(axis=1).astype(float)
+    vis_fraction = vis_count / (n_candidates + 1e-12)
+
+    # weight = area × (vis_fraction + balance × (1 − vis_fraction))
+    weighted_areas = areas * (vis_fraction + balance * (1.0 - vis_fraction))
+    # Exclude faces never seen from any direction
+    visible = vis_count > 0
+    return kmeans_on_sphere(normals[visible], weighted_areas[visible], k=k)
+
+
 # ── Example usage ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
