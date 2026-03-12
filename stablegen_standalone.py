@@ -9,21 +9,21 @@ Pipeline:
   5. Bake all views onto the mesh UV atlas (vectorised NumPy)
   6. Export textured mesh (GLB / OBJ+MTL)
 
-Usage (from PS C:\workspace\MODEL\StableGen):
-    .\.venv\Scripts\python.exe stablegen_standalone.py `
+Usage (from PS C:\\workspace\\MODEL\\StableGen):
+    .\\.venv\\Scripts\\python.exe stablegen_standalone.py `
         --mesh sphere.obj `
         --prompt "ancient stone wall with moss" `
         --output ./out `
         --server 127.0.0.1:8188
 
     # Check ComfyUI is reachable first:
-    .\.venv\Scripts\python.exe stablegen_standalone.py --check
+    .\\.venv\\Scripts\\python.exe stablegen_standalone.py --check
 
 Dependencies:
-    .\.venv\Scripts\python.exe -m pip install trimesh pillow numpy requests websocket-client
-    .\.venv\Scripts\python.exe -m pip install pyrender      # optional: depth rendering for ControlNet
-    .\.venv\Scripts\python.exe -m pip install opencv-python # optional: Canny edges
-    .\.venv\Scripts\python.exe -m pip install xatlas        # optional: proper UV unwrap if mesh has no UVs
+    .\\.venv\\Scripts\\python.exe -m pip install trimesh pillow numpy requests websocket-client
+    .\\.venv\\Scripts\\python.exe -m pip install pyrender      # optional: depth rendering for ControlNet
+    .\\.venv\\Scripts\\python.exe -m pip install opencv-python # optional: Canny edges
+    .\\.venv\\Scripts\\python.exe -m pip install xatlas        # optional: proper UV unwrap if mesh has no UVs
 
 Arguments:
   --mesh FILE          Input mesh (.obj, .glb, .stl, .fbx)
@@ -62,7 +62,6 @@ from io import BytesIO
 
 import numpy as np
 import requests
-import websocket
 from PIL import Image
 
 import trimesh
@@ -173,6 +172,150 @@ def _perspective_matrix(yfov, aspect, znear=0.01, zfar=1000.0):
         [0,          0,  (zfar + znear) / (znear - zfar),  2 * zfar * znear / (znear - zfar)],
         [0,          0, -1,                                              0],
     ])
+
+
+def estimate_settings(mesh):
+    """
+    Analyse mesh geometry and suggest pipeline settings for an unattended run.
+
+    Camera-mode selection signals
+    ─────────────────────────────
+    Mode 1  orbit ring     — rotationally symmetric around Z (columns, vases,
+                             characters): high Z-elongation + Z-aligned PCA axis
+    Mode 2  fan arc        — strong dominant front face (reliefs, logos, busts):
+                             area-weighted mean normal has high magnitude
+    Mode 3  hemisphere     — nearly uniform normal distribution, no strong structure
+    Mode 4  PCA axes       — clearly box-like / elongated along one axis:
+                             high PCA eigenvalue ratio, non-Z-aligned primary axis
+    Mode 5  K-means        — organic general shape (default)
+    Mode 6  greedy         — concave / undercut mesh: low mean face visibility
+    Mode 7  vis-weighted   — complex with many hard-to-see faces: high visibility
+                             variance (some faces rarely visible)
+
+    Returns a dict with keys matching argparse dest names plus a 'reasons' dict.
+    """
+    fn    = np.array(mesh.face_normals, dtype=np.float32)   # (F, 3)
+    verts = np.array(mesh.vertices,     dtype=np.float32)   # (V, 3)
+    areas = np.array([f.area for f in mesh.faces_unique_edges], dtype=np.float32) \
+            if hasattr(mesh, 'faces_unique_edges') else \
+            np.ones(len(fn), dtype=np.float32)
+    # Reliable face areas via cross product
+    v0 = verts[mesh.faces[:, 0]]
+    v1 = verts[mesh.faces[:, 1]]
+    v2 = verts[mesh.faces[:, 2]]
+    areas = np.linalg.norm(np.cross(v1 - v0, v2 - v0), axis=1) * 0.5
+    areas = np.maximum(areas, 1e-12)
+    n_faces = len(fn)
+
+    # ── Signal 1: PCA eigenvalues → shape elongation ──────────────────────────
+    centered  = verts - verts.mean(axis=0)
+    cov       = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)               # ascending order
+    eigvals   = np.abs(eigvals[::-1])                     # descending
+    eigvecs   = eigvecs[:, ::-1]                          # matching eigenvectors
+    primary_axis = eigvecs[:, 0]                          # longest axis
+    elongation   = float(eigvals[0] / (eigvals[2] + 1e-12))
+    z_align      = float(abs(primary_axis[2]))            # 1.0 = axis is Z
+
+    # ── Signal 2: dominant front-face (area-weighted mean normal magnitude) ───
+    aw_mean = (fn * areas[:, np.newaxis]).sum(axis=0)
+    aw_mean_mag = float(np.linalg.norm(aw_mean)) / float(areas.sum())
+    # 0 = symmetric (all sides equal), 1 = all faces point the same way
+
+    # ── Signal 3: mean face visibility (back-face only) ───────────────────────
+    # Sample 100 sphere directions; fraction visible to each face → mean
+    cands = np.array(fibonacci_sphere_points(100), dtype=np.float32)
+    vis   = fn @ cands.T > 0.26                           # (F, 100) bool
+    mean_vis  = float(vis.mean())                         # 0..1
+    vis_std   = float(vis.astype(np.float32).std())       # high = uneven visibility
+
+    # ── Signal 4: normal spread ───────────────────────────────────────────────
+    normal_spread = float(fn.std(axis=0).mean())          # ~0 convex, ~0.58 uniform
+
+    # ── Camera mode decision ──────────────────────────────────────────────────
+    # Priority: most specific signal wins.
+
+    if mean_vis < 0.18:
+        # Many faces are rarely visible → greedy maximises coverage
+        camera_mode = 6
+        mode_reason = f"low mean visibility {mean_vis:.2f} — concave/undercut mesh"
+
+    elif vis_std > 0.38 and mean_vis < 0.30:
+        # High spread in visibility → many hard-to-see faces
+        camera_mode = 7
+        mode_reason = (f"high visibility variance {vis_std:.2f} — "
+                       "visibility-weighted K-means")
+
+    elif aw_mean_mag > 0.55:
+        # Strong dominant direction → fan arc covers the important face well
+        camera_mode = 2
+        mode_reason = f"dominant front face (area-weighted normal mag {aw_mean_mag:.2f})"
+
+    elif elongation > 3.5 and z_align > 0.65:
+        # Tall object symmetric around Z → orbit ring
+        camera_mode = 1
+        mode_reason = (f"Z-elongated symmetric shape "
+                       f"(elongation {elongation:.1f}, Z-align {z_align:.2f})")
+
+    elif elongation > 3.0 and z_align < 0.35:
+        # Elongated but not upright → PCA axes capture the key views
+        camera_mode = 4
+        mode_reason = (f"elongated non-upright shape "
+                       f"(elongation {elongation:.1f}, Z-align {z_align:.2f})")
+
+    elif normal_spread > 0.50:
+        # High normal entropy, no special structure → even hemisphere coverage
+        camera_mode = 3
+        mode_reason = f"high normal spread {normal_spread:.2f} — hemisphere"
+
+    else:
+        camera_mode = 5
+        mode_reason = f"general organic shape — K-means normals (default)"
+
+    # ── Camera count ──────────────────────────────────────────────────────────
+    # More cameras needed when visibility is low or normal entropy is high.
+    if mean_vis < 0.20 or normal_spread > 0.50:
+        cameras, cam_reason = 10, f"complex surface (vis={mean_vis:.2f}, spread={normal_spread:.2f})"
+    elif mean_vis < 0.28 or normal_spread > 0.38:
+        cameras, cam_reason = 8,  f"moderate complexity (vis={mean_vis:.2f})"
+    elif aw_mean_mag > 0.55:
+        cameras, cam_reason = 4,  f"dominant front face — fewer views needed"
+    else:
+        cameras, cam_reason = 6,  f"standard (vis={mean_vis:.2f}, spread={normal_spread:.2f})"
+
+    # ── Texture size ──────────────────────────────────────────────────────────
+    raw = math.sqrt(n_faces) * 4
+    tex_size = 512
+    for s in (512, 1024, 2048):
+        if raw >= s:
+            tex_size = s
+    tex_reason = f"face count {n_faces:,} → target ~{int(raw)}px"
+
+    # ── ControlNet strength ───────────────────────────────────────────────────
+    # Use depth variance relative to bounding-box depth as a structure signal.
+    bbox_depth = float(mesh.extents[2]) if mesh.extents[2] > 0 else 1.0
+    rel_var    = float(np.var(verts[:, 2])) / (bbox_depth ** 2)
+    if rel_var > 0.05:
+        cs, cs_reason = 0.75, f"high depth variance {rel_var:.3f} — structured mesh"
+    elif rel_var < 0.01:
+        cs, cs_reason = 0.50, f"low depth variance {rel_var:.3f} — flat/organic"
+    else:
+        cs, cs_reason = 0.60, "moderate depth variance (default)"
+
+    return {
+        "cameras":              cameras,
+        "camera_mode":          camera_mode,
+        "tex_size":             tex_size,
+        "steps":                20,
+        "cfg":                  7.0,
+        "controlnet_strength":  cs,
+        "reasons": {
+            "cameras":             cam_reason,
+            "camera_mode":         mode_reason,
+            "tex_size":            tex_reason,
+            "controlnet_strength": cs_reason,
+        },
+    }
 
 
 def build_cameras(mesh, n_cameras, mode, render_w, render_h, yfov_deg=60.0):
@@ -323,9 +466,20 @@ def _queue_prompt(server, client_id, prompt):
 
 def _run_workflow(server, prompt_dict):
     """Queue a prompt and collect the first image from a SaveImageWebsocket node."""
+    try:
+        import websocket as _websocket
+        if not hasattr(_websocket, 'create_connection'):
+            raise ImportError(
+                "Wrong 'websocket' package installed (WSGI server package). "
+                "Run: .venv\\Scripts\\python.exe -m pip uninstall websocket -y && "
+                ".venv\\Scripts\\python.exe -m pip install websocket-client"
+            )
+    except ImportError as _e:
+        print(f"[standalone] ERROR: {_e}", file=sys.stderr)
+        return None
     client_id = str(uuid.uuid4())
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://{server}/ws?clientId={client_id}", timeout=10)
+    ws = _websocket.create_connection(
+        f"ws://{server}/ws?clientId={client_id}", timeout=10)
     ws.settimeout(300)
 
     prompt_id = _queue_prompt(server, client_id, prompt_dict)
@@ -335,7 +489,7 @@ def _run_workflow(server, prompt_dict):
     while True:
         try:
             out = ws.recv()
-        except websocket.WebSocketTimeoutException:
+        except _websocket.WebSocketTimeoutException:
             print("[standalone] WebSocket timeout", file=sys.stderr)
             break
         except Exception as e:
@@ -428,6 +582,138 @@ def _build_sdxl_controlnet_depth(prompt, negative, checkpoint,
         "7":  {"class_type": "SaveImageWebsocket",
                "inputs": {"images": ["6", 0]}},
     }
+
+
+# ── Known upscale models ───────────────────────────────────────────────────────
+
+_UPSCALE_MODELS = {
+    "4x-UltraSharp.pth": {
+        "url":  "https://huggingface.co/lokCX/4x-Ultrasharp/resolve/main/4x-UltraSharp.pth",
+        "desc": "4x — very sharp edges, great for textures (recommended)",
+        "size": "~67 MB",
+    },
+    "RealESRGAN_x4plus.pth": {
+        "url":  "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+        "desc": "4x — natural/organic surfaces, less aggressive sharpening",
+        "size": "~64 MB",
+    },
+    "4x_foolhardy_Remacri.pth": {
+        "url":  "https://huggingface.co/FacehuggerR/4x_foolhardy_Remacri/resolve/main/4x_foolhardy_Remacri.pth",
+        "desc": "4x — painterly / stylised output",
+        "size": "~67 MB",
+    },
+    "8x_NMKD-Superscale_150000_G.pth": {
+        "url":  "https://huggingface.co/Akumetsu971/SD_Anime_Futuristic_Armor/resolve/main/8x_NMKD-Superscale_150000_G.pth",
+        "desc": "8x — maximum resolution, longer processing",
+        "size": "~67 MB",
+    },
+}
+
+
+def download_upscaler(model_name, dest_dir):
+    """
+    Download a known upscale model into dest_dir with a progress bar.
+    dest_dir should be ComfyUI's models/upscale_models/ folder.
+    Returns the saved file path, or None on failure.
+    """
+    if model_name not in _UPSCALE_MODELS:
+        print(f"[download] Unknown model '{model_name}'.", file=sys.stderr)
+        print(f"[download] Known models:", file=sys.stderr)
+        for name, info in _UPSCALE_MODELS.items():
+            print(f"             {name}  — {info['desc']}", file=sys.stderr)
+        return None
+
+    entry    = _UPSCALE_MODELS[model_name]
+    url      = entry["url"]
+    out_path = os.path.join(dest_dir, model_name)
+
+    if os.path.exists(out_path):
+        print(f"[download] Already exists: {out_path}")
+        return out_path
+
+    os.makedirs(dest_dir, exist_ok=True)
+    print(f"[download] {model_name}  ({entry['size']})  {entry['desc']}")
+    print(f"[download] → {out_path}")
+
+    try:
+        resp = requests.get(url, stream=True, timeout=60,
+                            headers={"User-Agent": "stablegen-standalone/1.0"})
+        resp.raise_for_status()
+        total      = int(resp.headers.get("content-length", 0))
+        downloaded = 0
+        bar_width  = 40
+
+        with open(out_path, "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                fh.write(chunk)
+                downloaded += len(chunk)
+                if total:
+                    frac   = downloaded / total
+                    filled = int(bar_width * frac)
+                    bar    = "#" * filled + "-" * (bar_width - filled)
+                    mb     = downloaded / (1024 ** 2)
+                    total_mb = total   / (1024 ** 2)
+                    print(f"\r  [{bar}] {mb:.1f}/{total_mb:.1f} MB",
+                          end="", flush=True)
+        print()
+        print(f"[download] Saved: {out_path}")
+        return out_path
+
+    except Exception as e:
+        print(f"\n[download] Failed: {e}", file=sys.stderr)
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        return None
+
+
+def _build_upscale_workflow(image_name, upscale_model):
+    """
+    ComfyUI workflow: load image → ImageUpscaleWithModel → SaveImageWebsocket.
+    Requires an upscale model in ComfyUI models/upscale_models/
+    (e.g. 4x-UltraSharp.pth, RealESRGAN_x4plus.pth).
+    """
+    return {
+        "1": {"class_type": "UpscaleModelLoader",
+              "inputs": {"model_name": upscale_model}},
+        "2": {"class_type": "LoadImage",
+              "inputs": {"image": image_name}},
+        "3": {"class_type": "ImageUpscaleWithModel",
+              "inputs": {"upscale_model": ["1", 0], "image": ["2", 0]}},
+        "4": {"class_type": "SaveImageWebsocket",
+              "inputs": {"images": ["3", 0]}},
+    }
+
+
+def upscale_texture(server, texture_img, upscale_model, save_dir=None):
+    """
+    Upload texture_img to ComfyUI, run an upscale model, return upscaled PIL.Image.
+    Returns the original image unchanged if anything fails.
+    """
+    tmp = os.path.join(save_dir or ".", "_texture_for_upscale.png")
+    texture_img.save(tmp)
+    try:
+        info = _upload_image(server, tmp)
+        if not info:
+            print("[upscale] Upload failed — skipping upscale", file=sys.stderr)
+            return texture_img
+        image_name = info.get("name", os.path.basename(tmp))
+        wf = _build_upscale_workflow(image_name, upscale_model)
+        result = _run_workflow(server, wf)
+        if result is None:
+            print("[upscale] Workflow returned no image — skipping upscale",
+                  file=sys.stderr)
+            return texture_img
+        print(f"[upscale] {texture_img.size[0]}x{texture_img.size[1]}"
+              f" → {result.size[0]}x{result.size[1]}  (model: {upscale_model})")
+        return result
+    except Exception as e:
+        print(f"[upscale] Failed: {e} — keeping original texture", file=sys.stderr)
+        return texture_img
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def generate_view(server, args, cam_idx, depth_img=None, save_dir=None):
@@ -1309,8 +1595,27 @@ def _parse_args():
     p.add_argument("--save-views",          action="store_true")
     p.add_argument("--spherical-uv",        action="store_true",
                    help="Force spherical UV instead of mesh UVs or xatlas")
+    p.add_argument("--upscale-result",      action="store_true",
+                   help="Upscale the baked texture with an upscale model after generation")
+    p.add_argument("--upscale-model",       metavar="MODEL",
+                   default="4x-UltraSharp.pth",
+                   help="Upscale model in ComfyUI models/upscale_models/ "
+                        "(default: 4x-UltraSharp.pth)")
+    p.add_argument("--list-upscalers",      action="store_true",
+                   help="List known downloadable upscale models and exit")
+    p.add_argument("--download-upscaler",   metavar="MODEL",
+                   help="Download a known upscale model (use --list-upscalers to see names)")
+    p.add_argument("--comfyui-dir",         metavar="DIR",
+                   default="",
+                   help="Path to ComfyUI installation (used by --download-upscaler to "
+                        "place model in models/upscale_models/)")
     p.add_argument("--check",               action="store_true",
                    help="Check ComfyUI connection and print server info, then exit")
+    p.add_argument("--suggest",             action="store_true",
+                   help="Load mesh, print recommended settings as a command line, then exit")
+    p.add_argument("--auto",                action="store_true",
+                   help="Apply estimated settings (cameras/camera-mode/tex-size/controlnet-strength)"
+                        " unless those flags were explicitly passed")
     p.add_argument("--view",                action="store_true",
                    help="Open an interactive pygame viewer after texturing completes")
     p.add_argument("--camera-gui",          action="store_true",
@@ -1323,9 +1628,38 @@ def _parse_args():
 def main():
     args = _parse_args()
 
+    # --list-upscalers / --download-upscaler: no server or mesh needed
+    if args.list_upscalers:
+        print("\nKnown upscale models (--download-upscaler <name>):\n")
+        for name, info in _UPSCALE_MODELS.items():
+            print(f"  {name}")
+            print(f"    {info['desc']}  {info['size']}")
+            print(f"    {info['url']}")
+            print()
+        sys.exit(0)
+
+    if args.download_upscaler:
+        if args.comfyui_dir:
+            dest = os.path.join(args.comfyui_dir, "models", "upscale_models")
+        else:
+            dest = "."
+            print("[download] --comfyui-dir not set; saving to current directory")
+            print("[download] Use --comfyui-dir <path> to save directly into ComfyUI")
+        result = download_upscaler(args.download_upscaler, dest)
+        sys.exit(0 if result else 1)
+
+    # Track which auto-able args were explicitly provided vs left at default.
+    _AUTO_KEYS = ("cameras", "camera_mode", "tex_size", "controlnet_strength")
+    _explicit = {k: getattr(args, k) for k in _AUTO_KEYS
+                 if getattr(args, k) != {
+                     "cameras": 6, "camera_mode": 5,
+                     "tex_size": 1024, "controlnet_strength": 0.6,
+                 }[k]}
+
     # 1. Check ComfyUI — exits with code 1 and a clear message on failure.
-    #    Also the only thing --check needs; exit 0 after printing server info.
-    check_server(args.server)
+    #    --suggest skips this (no server needed to analyse a mesh).
+    if not args.suggest:
+        check_server(args.server)
     if args.check:
         sys.exit(0)
 
@@ -1335,17 +1669,6 @@ def main():
     if not os.path.isfile(args.mesh):
         print(f"[standalone] ERROR: mesh not found: {args.mesh}", file=sys.stderr)
         sys.exit(1)
-
-    print(f"[standalone] ── StableGen standalone ──")
-    print(f"[standalone] Mesh      : {args.mesh}")
-    print(f"[standalone] Prompt    : {args.prompt!r}")
-    print(f"[standalone] Checkpoint: {args.checkpoint}")
-    print(f"[standalone] Server    : {args.server}")
-    print(f"[standalone] Cameras   : {args.cameras} (mode {args.camera_mode})")
-    print(f"[standalone] pyrender  : {'yes' if _PYRENDER else 'no (pip install pyrender)'}")
-    print(f"[standalone] xatlas    : {'yes' if _XATLAS else 'no (pip install xatlas)'}")
-
-    os.makedirs(args.output, exist_ok=True)
 
     # 2. Load mesh
     print(f"[standalone] Loading mesh ...")
@@ -1361,6 +1684,47 @@ def main():
         sys.exit(1)
 
     print(f"[standalone] Mesh: {len(mesh.vertices):,} verts, {len(mesh.faces):,} faces")
+
+    # 2b. --suggest: print recommended command line and exit
+    if args.suggest:
+        s = estimate_settings(mesh)
+        r = s["reasons"]
+        print("\n[suggest] ── Recommended settings ──────────────────────────")
+        print(f"[suggest]  --cameras             {s['cameras']:>4}   # {r['cameras']}")
+        print(f"[suggest]  --camera-mode         {s['camera_mode']:>4}   # {r['camera_mode']}")
+        print(f"[suggest]  --tex-size            {s['tex_size']:>4}   # {r['tex_size']}")
+        print(f"[suggest]  --steps               {s['steps']:>4}")
+        print(f"[suggest]  --cfg                {s['cfg']:>5.1f}")
+        print(f"[suggest]  --controlnet-strength {s['controlnet_strength']:.2f}   # {r['controlnet_strength']}")
+        print()
+        prompt_q = f'--prompt "YOUR PROMPT"' if not args.prompt else f'--prompt {args.prompt!r}'
+        print(f"[suggest] Full command:")
+        print(f"  .\\venv\\Scripts\\python.exe stablegen_standalone.py \\")
+        print(f"    --mesh {args.mesh} {prompt_q} \\")
+        print(f"    --cameras {s['cameras']} --camera-mode {s['camera_mode']} \\")
+        print(f"    --tex-size {s['tex_size']} --steps {s['steps']} --cfg {s['cfg']} \\")
+        print(f"    --controlnet-strength {s['controlnet_strength']} \\")
+        print(f"    --checkpoint {args.checkpoint} --server {args.server} --output {args.output}")
+        sys.exit(0)
+
+    # 2c. --auto: apply estimated settings for any arg not explicitly passed
+    if args.auto:
+        s = estimate_settings(mesh)
+        for key in _AUTO_KEYS:
+            if key not in _explicit:
+                setattr(args, key, s[key])
+                print(f"[auto] {key}={s[key]}  ({s['reasons'].get(key, '')})")
+
+    print(f"[standalone] ── StableGen standalone ──")
+    print(f"[standalone] Mesh      : {args.mesh}")
+    print(f"[standalone] Prompt    : {args.prompt!r}")
+    print(f"[standalone] Checkpoint: {args.checkpoint}")
+    print(f"[standalone] Server    : {args.server}")
+    print(f"[standalone] Cameras   : {args.cameras} (mode {args.camera_mode})")
+    print(f"[standalone] pyrender  : {'yes' if _PYRENDER else 'no (pip install pyrender)'}")
+    print(f"[standalone] xatlas    : {'yes' if _XATLAS else 'no (pip install xatlas)'}")
+
+    os.makedirs(args.output, exist_ok=True)
 
     # 3. UV
     mesh, uv = ensure_uv(mesh, force_spherical=args.spherical_uv)
@@ -1422,11 +1786,17 @@ def main():
     texture = bake_texture(pos_map, normal_map, valid_mask,
                            cameras, gen_images, args.tex_size)
 
-    # 7. Export
+    # 7. Optional texture upscale
+    if args.upscale_result:
+        print(f"[standalone] Upscaling texture with {args.upscale_model} ...")
+        texture = upscale_texture(args.server, texture, args.upscale_model,
+                                  save_dir=args.output)
+
+    # 8. Export
     export_textured_mesh(mesh, uv, texture, args.output, args.export)
     print(f"\n[standalone] Done.  Output: {os.path.abspath(args.output)}")
 
-    # 8. Optional interactive viewer
+    # 9. Optional interactive viewer
     if args.view:
         view_result(mesh, uv, texture, warnings=view_warnings or None)
 
