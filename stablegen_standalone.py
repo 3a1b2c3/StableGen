@@ -756,6 +756,9 @@ def generate_view(server, args, cam_idx, depth_img=None, save_dir=None):
         traceback.print_exc()
         return None
 
+    if not images:
+        return None
+
     # Find first binary result from node "7" (SaveImageWebsocket)
     raw = None
     for node_id in ("7", "6", "5"):
