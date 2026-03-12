@@ -20,6 +20,7 @@ trimesh
 # ── Optional: pygame viewer / camera GUI ──────────────────────────────────────
 pygame
 PyOpenGL
+PyOpenGL_accelerate
 
 # ── Optional: better UV unwrap (stablegen_standalone.py) ──────────────────────
 # xatlas               # requires C compiler to build

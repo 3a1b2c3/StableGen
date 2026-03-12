@@ -547,30 +547,52 @@ Loads a mesh, places cameras, generates images via ComfyUI, and bakes the result
 
 **Install dependencies** (once):
 ```powershell
-.\.venv\Scripts\python.exe -m pip install trimesh pillow numpy requests websocket-client pyrender
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m pip install xatlas   # optional: proper UV unwrap if mesh has no UVs
 ```
 
-**Check ComfyUI is reachable before running:**
+> **Note:** If you have the `websocket` package installed (a WSGI server package), it shadows `websocket-client` and causes import errors. Fix with:
+> ```powershell
+> .\.venv\Scripts\python.exe -m pip uninstall websocket -y
+> ```
+
+**Check ComfyUI is reachable and list available checkpoints:**
 ```powershell
 .\.venv\Scripts\python.exe stablegen_standalone.py --check
 ```
 
 **Basic usage:**
 ```powershell
-.\.venv\Scripts\python.exe stablegen_standalone.py `
-    --mesh sphere.obj `
-    --prompt "ancient stone wall with moss" `
-    --checkpoint sd_xl_base_1.0.safetensors `
-    --output ./out `
-    --server 127.0.0.1:8188
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh sphere.obj --prompt "ancient stone wall with moss" --output ./out --server 127.0.0.1:8188
+```
+
+**Let the tool pick the best settings for your mesh:**
+```powershell
+# Print recommended command and exit
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --suggest
+
+# Apply recommended settings automatically
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --prompt "rusted metal" --auto
 ```
 
 **More options:**
 ```powershell
-# 8 cameras, K-means placement, export as GLB
+# 8 cameras, K-means placement, save each camera render, open viewer after
 .\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --prompt "rusted metal" `
-    --cameras 8 --camera-mode 5 --export glb --save-views
+    --cameras 8 --camera-mode 5 --export glb --save-views --view
+
+# Preview camera placement GUI before generating (Enter = proceed, Esc = abort)
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --prompt "wood planks" `
+    --camera-gui
+
+# Upscale the final texture using a ComfyUI upscale model
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --prompt "marble" `
+    --upscale-result --upscale-model 4x-UltraSharp.pth
+
+# List available upscale models / download one into ComfyUI
+.\.venv\Scripts\python.exe stablegen_standalone.py --list-upscalers
+.\.venv\Scripts\python.exe stablegen_standalone.py --download-upscaler 4x-UltraSharp.pth `
+    --comfyui-dir "C:\ComfyUI"
 
 # Disable ControlNet depth (faster, txt2img only)
 .\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --prompt "wood planks" `
@@ -588,9 +610,9 @@ Loads a mesh, places cameras, generates images via ComfyUI, and bakes the result
 | `--mesh FILE` | — | Input mesh (.obj, .glb, .stl) |
 | `--prompt TEXT` | `""` | Generation prompt |
 | `--negative TEXT` | `""` | Negative prompt |
-| `--checkpoint FILE` | `sd_xl_base_1.0.safetensors` | Checkpoint in ComfyUI models/checkpoints/ |
+| `--checkpoint FILE` | `RealVisXL_V5.0_fp16.safetensors` | Checkpoint in ComfyUI models/checkpoints/ |
 | `--cameras N` | `6` | Number of cameras |
-| `--camera-mode 1-7` | `5` | Placement strategy (5 = K-means normals) |
+| `--camera-mode 1-7` | `5` | Placement strategy (see table below) |
 | `--steps N` | `20` | Diffusion steps |
 | `--cfg F` | `7.0` | CFG scale |
 | `--seed N` | `-1` (random) | Seed |
@@ -599,11 +621,43 @@ Loads a mesh, places cameras, generates images via ComfyUI, and bakes the result
 | `--server ADDR` | `127.0.0.1:8188` | ComfyUI address |
 | `--output DIR` | `./sg_out` | Output directory |
 | `--export FORMAT` | `glb` | `glb` \| `obj` \| `none` |
-| `--no-controlnet` | off | Skip depth ControlNet |
+| `--no-controlnet` | off | Skip depth ControlNet (use plain txt2img) |
 | `--controlnet MODEL` | `control-lora-depth-rank128.safetensors` | ControlNet model |
 | `--controlnet-strength F` | `0.6` | ControlNet influence |
-| `--save-views` | off | Save per-camera generated images |
+| `--save-views` | off | Save each camera's generated image to output dir |
 | `--spherical-uv` | off | Force spherical UV (ignore mesh UVs) |
+| `--suggest` | off | Analyse mesh, print recommended settings, exit |
+| `--auto` | off | Apply estimated settings for any arg not explicitly set |
+| `--camera-gui` | off | Show camera placement GUI before generation |
+| `--view` | off | Open interactive 3D viewer after texturing completes |
+| `--upscale-result` | off | Upscale the final texture via ComfyUI |
+| `--upscale-model FILE` | `4x-UltraSharp.pth` | Upscale model in ComfyUI models/upscale_models/ |
+| `--list-upscalers` | off | List known upscale models with download info, exit |
+| `--download-upscaler FILE` | — | Download a known upscale model and exit |
+| `--comfyui-dir DIR` | — | ComfyUI root dir (for `--download-upscaler` placement) |
+| `--check` | off | Check ComfyUI connection and print server info, exit |
+
+**Camera placement modes:**
+
+| Mode | Strategy | Best for |
+|---|---|---|
+| `1` | Orbit ring | Tall, Z-symmetric objects (vases, columns) |
+| `2` | Fan arc | Objects with a clear dominant front face |
+| `3` | Fibonacci hemisphere | Convex objects needing even hemispherical coverage |
+| `4` | PCA axes | Elongated non-upright objects (weapons, vehicles) |
+| `5` | K-means normals *(default)* | General organic shapes |
+| `6` | Greedy coverage | Concave or heavily undercut meshes |
+| `7` | Visibility-weighted K-means | Meshes with large occluded areas |
+
+Use `--suggest` to let the tool pick the best mode automatically based on mesh geometry.
+
+**Output files** (all written to `--output` dir):
+
+| File | Written |
+|---|---|
+| `texture.png` | Always |
+| `textured_mesh.glb` / `.obj` | Always (unless `--export none`) |
+| `view_NN.png` | Only with `--save-views` |
 
 If `pyrender` is not installed, depth ControlNet is skipped automatically and plain txt2img is used. If `xatlas` is not installed and the mesh has no UVs, spherical UV mapping is used as fallback.
 
