@@ -25,6 +25,7 @@ with patch.object(sys, "argv", ["blender", "--", "--mesh", "test.obj", "--prompt
     # Exec with main() stubbed
     src = open(spec.origin, encoding="utf-8").read()
     src_no_main = src.replace("\nmain()\n", "\n# main() disabled for testing\n")
+    mod.__file__ = spec.origin
     exec(compile(src_no_main, spec.origin, "exec"), mod.__dict__)
     sys.modules["stablegen_cli"] = mod
 
@@ -33,6 +34,7 @@ class TestParseArgs(unittest.TestCase):
     def _parse(self, argv):
         with patch.object(sys, "argv", ["blender", "--"] + argv):
             mod2 = types.ModuleType("stablegen_cli_tmp")
+            mod2.__file__ = mod.__spec__.origin
             src2 = open(mod.__spec__.origin, encoding="utf-8").read()
             src2 = src2.replace("\nmain()\n", "\n")
             exec(compile(src2, mod.__spec__.origin, "exec"), mod2.__dict__)

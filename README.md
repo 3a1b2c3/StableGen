@@ -23,6 +23,7 @@ StableGen is an open-source Blender addon that brings generative AI into your 3D
   - [Generating a 3D Model with TRELLIS.2](#generating-a-3d-model-with-trellis2)
 - [📖 Usage & Parameters Overview](#-usage--parameters-overview)
 - [📁 Output Directory Structure](#-output-directory-structure)
+- [🖥️ Command-Line Interface (No Blender Required)](#️-command-line-interface-no-blender-required)
 - [🤔 Troubleshooting](#-troubleshooting)
 - [🤝 Contributing](#-contributing)
 - [📜 License](#-license)
@@ -532,6 +533,120 @@ StableGen organizes the generated files within the `Output Directory` specified 
             * `.gif` / `.mp4` *(If the `Export  GIF/MP4` tool is used, these files are saved directly into the timestamped revision directory)*
             * `prompt.json` *(The last generated workflow to be used in ComfyUI)*
          
+---
+
+## 🖥️ Command-Line Interface (No Blender Required)
+
+Two standalone CLI tools are available that run without opening Blender.
+
+---
+
+### `stablegen_standalone.py` — Full texturing pipeline
+
+Loads a mesh, places cameras, generates images via ComfyUI, and bakes the result onto a UV texture atlas — **no Blender installation needed**.
+
+**Install dependencies** (once):
+```powershell
+.\.venv\Scripts\python.exe -m pip install trimesh pillow numpy requests websocket-client pyrender
+.\.venv\Scripts\python.exe -m pip install xatlas   # optional: proper UV unwrap if mesh has no UVs
+```
+
+**Check ComfyUI is reachable before running:**
+```powershell
+.\.venv\Scripts\python.exe stablegen_standalone.py --check
+```
+
+**Basic usage:**
+```powershell
+.\.venv\Scripts\python.exe stablegen_standalone.py `
+    --mesh sphere.obj `
+    --prompt "ancient stone wall with moss" `
+    --checkpoint sd_xl_base_1.0.safetensors `
+    --output ./out `
+    --server 127.0.0.1:8188
+```
+
+**More options:**
+```powershell
+# 8 cameras, K-means placement, export as GLB
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --prompt "rusted metal" `
+    --cameras 8 --camera-mode 5 --export glb --save-views
+
+# Disable ControlNet depth (faster, txt2img only)
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --prompt "wood planks" `
+    --no-controlnet
+
+# Custom steps/CFG/seed
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --prompt "marble" `
+    --steps 30 --cfg 7.5 --seed 42 --tex-size 2048
+```
+
+**All arguments:**
+
+| Argument | Default | Description |
+|---|---|---|
+| `--mesh FILE` | — | Input mesh (.obj, .glb, .stl) |
+| `--prompt TEXT` | `""` | Generation prompt |
+| `--negative TEXT` | `""` | Negative prompt |
+| `--checkpoint FILE` | `sd_xl_base_1.0.safetensors` | Checkpoint in ComfyUI models/checkpoints/ |
+| `--cameras N` | `6` | Number of cameras |
+| `--camera-mode 1-7` | `5` | Placement strategy (5 = K-means normals) |
+| `--steps N` | `20` | Diffusion steps |
+| `--cfg F` | `7.0` | CFG scale |
+| `--seed N` | `-1` (random) | Seed |
+| `--width / --height N` | `1024` | Generated image resolution |
+| `--tex-size N` | `1024` | UV atlas resolution |
+| `--server ADDR` | `127.0.0.1:8188` | ComfyUI address |
+| `--output DIR` | `./sg_out` | Output directory |
+| `--export FORMAT` | `glb` | `glb` \| `obj` \| `none` |
+| `--no-controlnet` | off | Skip depth ControlNet |
+| `--controlnet MODEL` | `control-lora-depth-rank128.safetensors` | ControlNet model |
+| `--controlnet-strength F` | `0.6` | ControlNet influence |
+| `--save-views` | off | Save per-camera generated images |
+| `--spherical-uv` | off | Force spherical UV (ignore mesh UVs) |
+
+If `pyrender` is not installed, depth ControlNet is skipped automatically and plain txt2img is used. If `xatlas` is not installed and the mesh has no UVs, spherical UV mapping is used as fallback.
+
+---
+
+### `stablegen_cli.py` — Headless Blender pipeline
+
+Runs the full StableGen addon pipeline inside Blender without opening the GUI. Requires Blender 4.2–4.5 or 5.1+ with the StableGen addon installed.
+
+```powershell
+& "C:\Program Files\Blender Foundation\Blender 4.2\blender.exe" `
+    --background --python stablegen_cli.py -- `
+    --mesh sphere.obj `
+    --prompt "ancient stone wall with moss" `
+    --output ./out `
+    --server 127.0.0.1:8188
+```
+
+With baking and GLB export:
+```powershell
+& "C:\Program Files\Blender Foundation\Blender 4.2\blender.exe" `
+    --background --python stablegen_cli.py -- `
+    --mesh model.obj --prompt "rusted metal surface" `
+    --output ./out --server 127.0.0.1:8188 --bake --export glb
+```
+
+---
+
+### `camera_placement_cli.py` — Camera placement preview
+
+Preview camera directions for any mesh without Blender or ComfyUI.
+
+```bash
+python camera_placement_cli.py mesh.obj 5 --cameras 6              # K-means, pretty table
+python camera_placement_cli.py mesh.obj 1 --cameras 8 --elevation 20  # Orbit ring
+python camera_placement_cli.py mesh.obj 5 --cameras 6 --output csv    # CSV output
+python camera_placement_cli.py mesh.obj 6 --cameras 8 --coverage 0.90 # Greedy coverage
+python camera_placement_cli.py mesh.obj 7 --cameras 6 --balance 0.3   # Visibility-weighted
+python camera_placement_cli.py mesh.obj 5 --gui                        # pygame visualizer
+```
+
+Modes: `1` Orbit Ring · `2` Fan Arc · `3` Hemisphere · `4` PCA Axes · `5` K-means · `6` Greedy · `7` Visibility-Weighted
+
 ---
 
 ## 🤔 Troubleshooting
