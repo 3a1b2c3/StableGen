@@ -3,6 +3,8 @@ numpy
 pillow
 requests
 websocket-client
+# NOTE: if 'websocket' (server package) is also installed it shadows websocket-client.
+#       Fix: pip uninstall websocket -y
 
 # ── Blender addon only ─────────────────────────────────────────────────────────
 # opencv-python        # cv2 — Canny edges, image processing
@@ -16,8 +18,8 @@ trimesh
 # pyrender             # off-screen depth rendering
 
 # ── Optional: pygame viewer / camera GUI ──────────────────────────────────────
-# pygame
-# PyOpenGL
+pygame
+PyOpenGL
 
 # ── Optional: better UV unwrap (stablegen_standalone.py) ──────────────────────
 # xatlas               # requires C compiler to build

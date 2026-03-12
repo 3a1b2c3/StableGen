@@ -459,8 +459,24 @@ def check_server(server, timeout=5):
 
 def _queue_prompt(server, client_id, prompt):
     data = json.dumps({"prompt": prompt, "client_id": client_id}).encode()
-    req = urllib.request.Request(f"http://{server}/prompt", data=data)
-    resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
+    req = urllib.request.Request(
+        f"http://{server}/prompt", data=data,
+        headers={"Content-Type": "application/json"})
+    try:
+        resp = json.loads(urllib.request.urlopen(req, timeout=30).read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        try:
+            detail = json.loads(body)
+            # ComfyUI puts validation errors under 'error' and 'node_errors'
+            msg = detail.get("error", {})
+            node_errors = detail.get("node_errors", {})
+            print(f"[standalone] ComfyUI 400 error: {msg}", file=sys.stderr)
+            for nid, nerr in node_errors.items():
+                print(f"[standalone]   node {nid}: {nerr}", file=sys.stderr)
+        except Exception:
+            print(f"[standalone] ComfyUI 400 response: {body[:500]}", file=sys.stderr)
+        raise
     return resp["prompt_id"]
 
 

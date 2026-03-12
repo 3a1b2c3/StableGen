@@ -295,7 +295,7 @@ def draw_mode_menu(surf, mode_idx, rects, font):
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else "sphere.obj"
+    path = sys.argv[1] if len(sys.argv) > 1 else r"C:\workspace\MODEL\StableGen\assets\sphere.obj"
 
     pygame.init()
 
