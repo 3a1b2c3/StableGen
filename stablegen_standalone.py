@@ -1657,31 +1657,6 @@ def main():
     # 3. UV
     mesh, uv = ensure_uv(mesh, force_spherical=args.spherical_uv)
 
-    # 3b. --upscale-texture: skip generation, upscale an existing texture and re-export
-    if args.upscale_texture:
-        if args.upscale_texture == "auto":
-            texture = _get_texture(mesh) or _find_mesh_texture(args.mesh)
-            if texture is None:
-                print("[standalone] ERROR: --upscale-texture: no texture found in mesh or mesh folder",
-                      file=sys.stderr)
-                sys.exit(1)
-            _ut_label = f"auto texture ({texture.size[0]}x{texture.size[1]})"
-        else:
-            if not os.path.isfile(args.upscale_texture):
-                print(f"[standalone] ERROR: texture not found: {args.upscale_texture}",
-                      file=sys.stderr)
-                sys.exit(1)
-            texture = Image.open(args.upscale_texture).convert("RGB")
-            _ut_label = f"{args.upscale_texture} ({texture.size[0]}x{texture.size[1]})"
-        print(f"[standalone] Upscaling {_ut_label} with {args.upscale_model} ...")
-        texture = upscale_texture(args.server, texture, args.upscale_model,
-                                  save_dir=args.output)
-        export_textured_mesh(mesh, uv, texture, args.output, args.export)
-        print(f"\n[standalone] Done.  Output: {os.path.abspath(args.output)}")
-        if args.view:
-            view_result(mesh, uv, texture)
-        sys.exit(0)
-
     # 4. Place cameras
     cameras = build_cameras(mesh, args.cameras, args.camera_mode,
                             args.width, args.height)
@@ -1730,6 +1705,31 @@ def main():
             sys.exit(0)
         _save_cameras(cameras, _cam_save, mode=_gui_init_mode, n=len(cameras))
         print(f"[camera-gui] Camera selection saved to {_cam_save}")
+
+    # 3b. --upscale-texture: skip generation, upscale an existing texture and re-export
+    if args.upscale_texture:
+        if args.upscale_texture == "auto":
+            texture = _get_texture(mesh) or _find_mesh_texture(args.mesh)
+            if texture is None:
+                print("[standalone] ERROR: --upscale-texture: no texture found in mesh or mesh folder",
+                      file=sys.stderr)
+                sys.exit(1)
+            _ut_label = f"auto texture ({texture.size[0]}x{texture.size[1]})"
+        else:
+            if not os.path.isfile(args.upscale_texture):
+                print(f"[standalone] ERROR: texture not found: {args.upscale_texture}",
+                      file=sys.stderr)
+                sys.exit(1)
+            texture = Image.open(args.upscale_texture).convert("RGB")
+            _ut_label = f"{args.upscale_texture} ({texture.size[0]}x{texture.size[1]})"
+        print(f"[standalone] Upscaling {_ut_label} with {args.upscale_model} ...")
+        texture = upscale_texture(args.server, texture, args.upscale_model,
+                                  save_dir=args.output)
+        export_textured_mesh(mesh, uv, texture, args.output, args.export)
+        print(f"\n[standalone] Done.  Output: {os.path.abspath(args.output)}")
+        if args.view:
+            view_result(mesh, uv, texture)
+        sys.exit(0)
 
     # 5. Generate one image per camera
     gen_images = []
