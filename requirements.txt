@@ -1,0 +1,28 @@
+# ── Core (stablegen addon + standalone CLI) ────────────────────────────────────
+numpy
+pillow
+requests
+websocket-client
+trimesh
+
+# ── Blender addon only ─────────────────────────────────────────────────────────
+# opencv-python        # cv2 — Canny edges, image processing
+# imageio              # GIF / video export
+# imageio-ffmpeg       # video codec support for imageio
+
+# ── stablegen_standalone.py ───────────────────────────────────────────────────
+trimesh
+
+# ── Optional: USD import/export (stablegen_standalone.py) ────────────────────
+# usd-core             # USD (.usd/.usda/.usdc/.usdz) import and export
+
+# ── Optional: depth ControlNet (stablegen_standalone.py) ──────────────────────
+# pyrender             # off-screen depth rendering
+
+# ── Optional: pygame viewer / camera GUI ──────────────────────────────────────
+pygame
+PyOpenGL
+
+# ── Optional: better UV unwrap (stablegen_standalone.py) ──────────────────────
+xatlas               # requires C compiler to build
+wwww
