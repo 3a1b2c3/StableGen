@@ -1722,6 +1722,9 @@ def main():
                 sys.exit(1)
             texture = Image.open(args.upscale_texture).convert("RGB")
             _ut_label = f"{args.upscale_texture} ({texture.size[0]}x{texture.size[1]})"
+        _orig_path = os.path.join(args.output, "texture_original.png")
+        texture.save(_orig_path)
+        print(f"[standalone] Original texture saved: {_orig_path}")
         print(f"[standalone] Upscaling {_ut_label} with {args.upscale_model} ...")
         texture = upscale_texture(args.server, texture, args.upscale_model,
                                   save_dir=args.output)
