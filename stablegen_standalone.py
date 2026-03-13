@@ -1406,7 +1406,24 @@ def main():
 
     # 4b. Optional camera placement GUI
     if args.camera_gui:
-        if not view_cameras(mesh, cameras):
+        # Use mesh heuristics for the GUI starting values unless the user
+        # explicitly set those args on the command line.
+        _gui_suggested = estimate_settings(mesh)
+        _gui_init_n    = args.cameras    if "cameras"     in _explicit else _gui_suggested["cameras"]
+        _gui_init_mode = args.camera_mode if "camera_mode" in _explicit else _gui_suggested["camera_mode"]
+        if _gui_init_n != args.cameras or _gui_init_mode != args.camera_mode:
+            print(f"[camera-gui] heuristic start: {_gui_init_n} cams, "
+                  f"mode {_gui_init_mode} ({_gui_suggested['reasons']['cameras']}; "
+                  f"{_gui_suggested['reasons']['camera_mode']})")
+        _build_fn = lambda n, mode: build_cameras(
+            mesh, n, mode, args.width, args.height)
+        proceed, cameras = view_cameras(
+            mesh, cameras,
+            build_fn=_build_fn,
+            init_mode=_gui_init_mode,
+            init_n=_gui_init_n,
+        )
+        if not proceed:
             print("[standalone] Aborted by user in camera GUI.")
             sys.exit(0)
 

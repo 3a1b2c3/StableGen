@@ -304,6 +304,7 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
         glRotatef(yaw,   0, 1, 0)
 
         active_tex = coverage_tex_id if (show_coverage and coverage_tex_id) else mesh_tex_id
+        glEnable(GL_TEXTURE_2D)
         glBindTexture(GL_TEXTURE_2D, active_tex)
         glBegin(GL_TRIANGLES)
         for face in faces:
@@ -382,14 +383,32 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
 
 # ── Camera placement viewer ───────────────────────────────────────────────────
 
-def view_cameras(mesh, cameras):
+_CAM_MODES = [
+    (1, "Orbit"),
+    (2, "Fan"),
+    (3, "Hemisphere"),
+    (4, "PCA"),
+    (5, "K-Means"),
+    (6, "Greedy"),
+    (7, "Visibility"),
+]
+
+
+def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
     """
     Show the mesh + placed cameras in a pygame/OpenGL window.
     Each camera is drawn with its position, a line to the mesh centroid,
     and a frustum outline.
 
-    Returns True if the user pressed Enter/Space to proceed with texturing,
-    False if they pressed Esc to abort.
+    Optional args:
+        build_fn(n, mode_int) -> list[cam_dict]  – called when the user
+            changes mode or count.  If None, controls are hidden.
+        init_mode   – initial camera mode integer (1-7, default 5 = K-Means).
+        init_n      – initial camera count (defaults to len(cameras)).
+
+    Returns (proceed: bool, cameras: list).
+        proceed is True  when the user presses Enter/Space,
+                   False when they press Esc.
     """
     try:
         import pygame
@@ -414,7 +433,7 @@ def view_cameras(mesh, cameras):
         from OpenGL.GLU import gluPerspective
     except ImportError as e:
         print(f"[camera-gui] pygame/PyOpenGL not available: {e}", file=sys.stderr)
-        return True   # proceed anyway
+        return True, cameras   # proceed anyway
 
     # Same glGenTextures(1) bug workaround as view_result.
     def _gen_tex():
@@ -458,24 +477,73 @@ def view_cameras(mesh, cameras):
         ]
         cam_frustums.append((tip, corners))
 
-    # ── Face → best camera assignment (for coverage colouring) ────────────────
-    # For each face pick the camera whose direction most faces the face normal.
-    # "Direction toward face" ≈ negative of the normalised camera position
-    # (cameras orbit and look at the centroid/origin).
-    if cam_positions:
-        cam_dirs = np.array(
-            [-p / (np.linalg.norm(p) + 1e-8) for p in cam_positions],
-            dtype=np.float32,
-        )                                       # (C, 3)
-        scores   = face_normals_raw @ cam_dirs.T  # (F, C)
-        face_cam = np.argmax(scores, axis=1)      # (F,) best camera index
-        face_max = scores[np.arange(len(scores)), face_cam]
-    else:
-        face_cam = np.zeros(len(faces), dtype=np.int32)
-        face_max = np.ones(len(faces), dtype=np.float32)
+    def _recompute_coverage(positions):
+        """Return (face_cam, face_max) for a list of normalised cam positions."""
+        if positions:
+            dirs = np.array(
+                [-p / (np.linalg.norm(p) + 1e-8) for p in positions],
+                dtype=np.float32,
+            )
+            sc  = face_normals_raw @ dirs.T
+            fc  = np.argmax(sc, axis=1)
+            fm  = sc[np.arange(len(sc)), fc]
+        else:
+            fc = np.zeros(len(faces), dtype=np.int32)
+            fm = np.ones(len(faces), dtype=np.float32)
+        return fc, fm
+
+    face_cam, face_max = _recompute_coverage(cam_positions)
+
+    # ── Interactive mode state ─────────────────────────────────────────────────
+    TAB_H  = 32
+    TAB_W  = 900 // max(len(_CAM_MODES), 1)   # pixels per mode tab
+    CTRL_W = 140                                # width of cam-count control area
+
+    mode_int = init_mode
+    n_cams   = init_n if init_n is not None else len(cameras)
+    # 0-based index of current mode in _CAM_MODES
+    mode_idx = next((i for i, (m, _) in enumerate(_CAM_MODES) if m == mode_int), 4)
+
+    def _rebuild(new_mode_idx, new_n):
+        """Rebuild cameras and update coverage when mode/count changes."""
+        nonlocal cameras, cam_positions, cam_frustums, face_cam, face_max
+        nonlocal mode_idx, n_cams, mode_int
+        if build_fn is None:
+            return
+        mode_idx = new_mode_idx % len(_CAM_MODES)
+        mode_int, _ = _CAM_MODES[mode_idx]
+        n_cams = max(1, min(new_n, 32))
+        try:
+            cameras = build_fn(n_cams, mode_int)
+        except Exception as e:
+            print(f"[camera-gui] build_fn error: {e}", file=sys.stderr)
+            return
+        # Recompute positions and frustums
+        cam_positions.clear()
+        cam_frustums.clear()
+        for cam in cameras:
+            pos = (np.array(cam["pos"], dtype=np.float32) - centroid) / (scale if scale else 1)
+            cam_positions.append(pos)
+            pose   = np.array(cam["pose"], dtype=np.float32)
+            right  = pose[:3, 0]
+            up     = pose[:3, 1]
+            fwd    = -pose[:3, 2]
+            near   = np.linalg.norm(pos) * 0.15
+            hh     = near * math.tan(cam["yfov"] / 2)
+            hw     = hh * 1.0
+            tip    = pos
+            base_c = pos + fwd * near
+            corners = [
+                base_c + right * hw + up * hh,
+                base_c - right * hw + up * hh,
+                base_c - right * hw - up * hh,
+                base_c + right * hw - up * hh,
+            ]
+            cam_frustums.append((tip, corners))
+        face_cam, face_max = _recompute_coverage(cam_positions)
 
     # ── pygame / OpenGL init ───────────────────────────────────────────────────
-    W, H = 900, 700
+    W, H = 900, 700 + (TAB_H if build_fn else 0)
     pygame.init()
     pygame.display.set_mode((W, H), DOUBLEBUF | OPENGL)
     pygame.display.set_caption(
@@ -483,7 +551,8 @@ def view_cameras(mesh, cameras):
 
     glMatrixMode(GL_PROJECTION)
     glLoadIdentity()
-    gluPerspective(45.0, W / H, 0.01, 100.0)
+    VIEW_H = H - (TAB_H if build_fn else 0)
+    gluPerspective(45.0, W / VIEW_H, 0.01, 100.0)
     glMatrixMode(GL_MODELVIEW)
 
     glEnable(GL_DEPTH_TEST)
@@ -512,14 +581,148 @@ def view_cameras(mesh, cameras):
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
         return tid, sw, sh
 
+    tab_tex_ids = {}   # mode_idx -> (tid, w, h) for tab labels; rebuilt on change
+    tab_dirty   = [True]
+
+    def _build_tab_textures():
+        tab_tex_ids.clear()
+        for i, (_, name) in enumerate(_CAM_MODES):
+            active = (i == mode_idx)
+            col    = (20, 20, 25) if active else (200, 200, 210)
+            fnt    = font_bold if active else font_sm
+            surf   = fnt.render(name, True, col)
+            tab_tex_ids[i] = _surface_to_gl(surf)
+        tab_dirty[0] = False
+
+    def _draw_tab_bar():
+        """Draw the mode tab bar and camera-count control at the bottom."""
+        if not build_fn:
+            return
+        if tab_dirty[0]:
+            _build_tab_textures()
+        BAR_Y = VIEW_H
+        tab_w = (W - CTRL_W) // len(_CAM_MODES)
+
+        glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+        glOrtho(0, W, H, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity()
+        glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING)
+        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glDisable(GL_TEXTURE_2D)
+
+        # Background bar
+        glColor4f(0.12, 0.12, 0.16, 1.0)
+        glBegin(GL_QUADS)
+        glVertex2f(0, BAR_Y); glVertex2f(W, BAR_Y)
+        glVertex2f(W, H);     glVertex2f(0, H)
+        glEnd()
+
+        # Mode tabs
+        for i in range(len(_CAM_MODES)):
+            tx = i * tab_w
+            active = (i == mode_idx)
+            r, g, b = (0.25, 0.55, 0.85) if active else (0.18, 0.18, 0.22)
+            glColor4f(r, g, b, 1.0)
+            glBegin(GL_QUADS)
+            glVertex2f(tx + 1,        BAR_Y + 2)
+            glVertex2f(tx + tab_w - 1, BAR_Y + 2)
+            glVertex2f(tx + tab_w - 1, H - 2)
+            glVertex2f(tx + 1,        H - 2)
+            glEnd()
+            tid, tw, th = tab_tex_ids[i]
+            cx = tx + (tab_w - tw) // 2
+            cy = BAR_Y + (TAB_H - th) // 2
+            glEnable(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, tid)
+            glColor4f(1, 1, 1, 1)
+            glBegin(GL_QUADS)
+            glTexCoord2f(0,1); glVertex2f(cx,      cy)
+            glTexCoord2f(1,1); glVertex2f(cx + tw, cy)
+            glTexCoord2f(1,0); glVertex2f(cx + tw, cy + th)
+            glTexCoord2f(0,0); glVertex2f(cx,      cy + th)
+            glEnd()
+            glDisable(GL_TEXTURE_2D)
+
+        # Camera count control  [ - ]  Cams: N  [ + ]
+        BTN_W = 28
+        cx0   = W - CTRL_W
+        mid_w = CTRL_W - BTN_W * 2
+
+        def _btn(x, label, hover=False):
+            r, g, b = (0.35, 0.60, 0.90) if hover else (0.22, 0.22, 0.28)
+            glDisable(GL_TEXTURE_2D)
+            glColor4f(r, g, b, 1.0)
+            glBegin(GL_QUADS)
+            glVertex2f(x + 1,         BAR_Y + 2)
+            glVertex2f(x + BTN_W - 1, BAR_Y + 2)
+            glVertex2f(x + BTN_W - 1, H - 2)
+            glVertex2f(x + 1,         H - 2)
+            glEnd()
+            s = font_bold.render(label, True, (230, 230, 255))
+            t, tw, th = _surface_to_gl(s)
+            bx = x + (BTN_W - tw) // 2
+            by = BAR_Y + (TAB_H - th) // 2
+            glEnable(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, t)
+            glColor4f(1, 1, 1, 1)
+            glBegin(GL_QUADS)
+            glTexCoord2f(0,1); glVertex2f(bx,      by)
+            glTexCoord2f(1,1); glVertex2f(bx + tw, by)
+            glTexCoord2f(1,0); glVertex2f(bx + tw, by + th)
+            glTexCoord2f(0,0); glVertex2f(bx,      by + th)
+            glEnd()
+            glDeleteTextures([t])
+
+        mx_now, my_now = pygame.mouse.get_pos()
+        minus_hover = (cx0 <= mx_now < cx0 + BTN_W) and my_now >= VIEW_H
+        plus_hover  = (W - BTN_W <= mx_now < W)     and my_now >= VIEW_H
+
+        _btn(cx0,          "−", hover=minus_hover)
+        _btn(W - BTN_W,    "+", hover=plus_hover)
+
+        # Count label in the middle
+        glDisable(GL_TEXTURE_2D)
+        glColor4f(0.15, 0.15, 0.20, 1.0)
+        glBegin(GL_QUADS)
+        glVertex2f(cx0 + BTN_W,         BAR_Y + 2)
+        glVertex2f(cx0 + BTN_W + mid_w, BAR_Y + 2)
+        glVertex2f(cx0 + BTN_W + mid_w, H - 2)
+        glVertex2f(cx0 + BTN_W,         H - 2)
+        glEnd()
+        s = font_bold.render(f"{n_cams}", True, (200, 220, 255))
+        t, tw, th = _surface_to_gl(s)
+        lx = cx0 + BTN_W + (mid_w - tw) // 2
+        ly = BAR_Y + (TAB_H - th) // 2
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, t)
+        glColor4f(1, 1, 1, 1)
+        glBegin(GL_QUADS)
+        glTexCoord2f(0,1); glVertex2f(lx,      ly)
+        glTexCoord2f(1,1); glVertex2f(lx + tw, ly)
+        glTexCoord2f(1,0); glVertex2f(lx + tw, ly + th)
+        glTexCoord2f(0,0); glVertex2f(lx,      ly + th)
+        glEnd()
+        glDeleteTextures([t])
+        glDisable(GL_TEXTURE_2D)
+
+        glDisable(GL_BLEND)
+        glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING)
+        glMatrixMode(GL_PROJECTION); glPopMatrix()
+        glMatrixMode(GL_MODELVIEW);  glPopMatrix()
+
     def _make_hud(fps):
         PAD, LH = 6, 18
         lines = []
         r255  = lambda rgb: tuple(int(c * 255) for c in rgb)
+        mode_name = _CAM_MODES[mode_idx][1] if build_fn else ""
         lines.append((font_sm,   f"{len(cameras)} cameras  |  "
-                                  f"{len(mesh.vertices):,} verts  |  FPS {fps:3d}",
+                                  f"{len(mesh.vertices):,} verts  |  FPS {fps:3d}"
+                                  + (f"  |  {mode_name}" if build_fn else ""),
                       (200, 200, 200)))
-        lines.append((font_sm,   "Enter/Space = proceed   Esc = abort   drag = orbit   scroll = zoom",
+        ctrl_hint = "  ←/→: mode   +/-: count" if build_fn else ""
+        lines.append((font_sm,
+                       "Enter/Space = proceed   Esc = abort   drag = orbit   scroll = zoom"
+                       + ctrl_hint,
                       (160, 160, 160)))
         lines.append((font_sm,   "", (0, 0, 0)))
         for ci, pos in enumerate(cam_positions):
@@ -580,9 +783,36 @@ def view_cameras(mesh, cameras):
                     running = False
                 elif event.key == pygame.K_ESCAPE:
                     proceed, running = False, False
+                elif event.key in (pygame.K_RIGHT, pygame.K_TAB) and build_fn:
+                    _rebuild(mode_idx + 1, n_cams)
+                    tab_dirty[0] = True; hud_tid = None
+                elif event.key == pygame.K_LEFT and build_fn:
+                    _rebuild(mode_idx - 1, n_cams)
+                    tab_dirty[0] = True; hud_tid = None
+                elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS) and build_fn:
+                    _rebuild(mode_idx, n_cams + 1)
+                    hud_tid = None
+                elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS) and build_fn:
+                    _rebuild(mode_idx, n_cams - 1)
+                    hud_tid = None
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
-                    dragging, last_mouse = True, event.pos
+                    mx, my = event.pos
+                    # Click on mode tab bar / count buttons?
+                    if build_fn and my >= VIEW_H:
+                        BTN_W = 28
+                        if mx >= W - BTN_W:               # [+]
+                            _rebuild(mode_idx, n_cams + 1); hud_tid = None
+                        elif mx >= W - CTRL_W and mx < W - CTRL_W + BTN_W:  # [-]
+                            _rebuild(mode_idx, n_cams - 1); hud_tid = None
+                        else:
+                            tab_w = (W - CTRL_W) // len(_CAM_MODES)
+                            ti = mx // tab_w
+                            if ti < len(_CAM_MODES):
+                                _rebuild(ti, n_cams)
+                                tab_dirty[0] = True; hud_tid = None
+                    else:
+                        dragging, last_mouse = True, event.pos
                 elif event.button == 4:
                     zoom = min(zoom + 0.2, -0.5)
                 elif event.button == 5:
@@ -673,11 +903,14 @@ def view_cameras(mesh, cameras):
             hud_tid, hud_w, hud_h = _make_hud(fps)
 
         _draw_quad(hud_tid, hud_w, hud_h, x=10, y=10)
+        _draw_tab_bar()
 
         pygame.display.flip()
         clock.tick(60)
 
     if hud_tid is not None:
         glDeleteTextures([hud_tid])
+    for tid, _, _ in tab_tex_ids.values():
+        glDeleteTextures([tid])
     pygame.quit()
-    return proceed
+    return proceed, cameras
