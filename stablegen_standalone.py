@@ -26,7 +26,7 @@ Dependencies:
     .\\.venv\\Scripts\\python.exe -m pip install xatlas        # optional: proper UV unwrap if mesh has no UVs
 
 Arguments:
-  --mesh FILE          Input mesh (.obj, .glb, .stl, .fbx)
+  --mesh FILE          Input mesh (.obj, .glb, .stl, .fbx, .usd, .usda, .usdc, .usdz)
   --prompt TEXT        Generation prompt
   --negative TEXT      Negative prompt  (default: "")
   --checkpoint FILE    Checkpoint filename in ComfyUI models/checkpoints/
@@ -67,6 +67,71 @@ from PIL import Image
 import trimesh
 import trimesh.visual
 import trimesh.visual.texture
+
+
+# ── USD mesh loader (pxr / usd-core fallback) ─────────────────────────────────
+
+_USD_EXTENSIONS = {".usd", ".usda", ".usdc", ".usdz"}
+
+
+def _load_usd_mesh(path):
+    """Load a USD/USDA/USDC/USDZ file using pxr (usd-core).
+
+    Traverses all UsdGeom.Mesh prims, triangulates faces, applies the world
+    transform, and concatenates everything into a single trimesh.Trimesh.
+    Raises RuntimeError with install hint when pxr is not available.
+    """
+    try:
+        from pxr import Usd, UsdGeom  # type: ignore
+    except ImportError:
+        raise RuntimeError(
+            "Loading USD files requires the 'usd-core' package.\n"
+            "Install it with:  pip install usd-core"
+        )
+
+    stage = Usd.Stage.Open(str(path))
+    parts = []
+
+    for prim in stage.Traverse():
+        if not prim.IsA(UsdGeom.Mesh):
+            continue
+        schema = UsdGeom.Mesh(prim)
+
+        pts = schema.GetPointsAttr().Get()
+        counts = schema.GetFaceVertexCountsAttr().Get()
+        indices = schema.GetFaceVertexIndicesAttr().Get()
+        if pts is None or counts is None or indices is None:
+            continue
+
+        verts = np.array(pts, dtype=np.float64)
+        counts = np.array(counts, dtype=np.int32)
+        indices = np.array(indices, dtype=np.int32)
+
+        # Fan-triangulate each face (handles tris, quads and n-gons)
+        faces = []
+        idx = 0
+        for n in counts:
+            v0 = indices[idx]
+            for k in range(1, n - 1):
+                faces.append([v0, indices[idx + k], indices[idx + k + 1]])
+            idx += n
+        if not faces:
+            continue
+        faces = np.array(faces, dtype=np.int32)
+
+        # Apply world transform so concatenated meshes are in the right place
+        xformable = UsdGeom.Xformable(prim)
+        mat = xformable.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+        m = np.array(mat).reshape(4, 4).T  # USD matrices are row-major
+        verts_h = np.hstack([verts, np.ones((len(verts), 1))])
+        verts = (verts_h @ m.T)[:, :3]
+
+        parts.append(trimesh.Trimesh(vertices=verts, faces=faces, process=False))
+
+    if not parts:
+        raise ValueError(f"No mesh geometry found in USD file: {path}")
+
+    return trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
 
 STABLEGEN_DIR = os.path.dirname(os.path.abspath(__file__))
 if STABLEGEN_DIR not in sys.path:
@@ -378,7 +443,8 @@ def render_depth_view(mesh, cam, width, height):
     scene.add(camera, pose=cam["pose"])
 
     try:
-        os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
+        if sys.platform != "win32":
+            os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
         renderer = pyrender.OffscreenRenderer(width, height)
         _, depth = renderer.render(scene)
         renderer.delete()
@@ -1066,6 +1132,57 @@ def bake_texture(pos_map, normal_map, valid_mask, cameras, gen_images, tex_size)
     return Image.fromarray(tex, "RGB")
 
 
+def bake_coverage_texture(pos_map, normal_map, valid_mask, cameras, tex_size):
+    """
+    Debug texture: each texel is painted with the flat colour of its
+    dominant (highest angle-weight) camera.  Use T in the viewer to toggle.
+    Returns PIL.Image (RGB).
+    """
+    _COLORS = [
+        (255,  84,  84), ( 84, 191, 255), (102, 230, 102),
+        (255, 217,  51), (230, 102, 230), ( 77, 242, 217),
+        (255, 153,  51), (153, 102, 255), (204, 255, 102),
+        (255, 115, 178), (102, 178, 255), (242, 178, 102),
+    ]
+    tex     = np.zeros((tex_size, tex_size, 3), np.uint8)
+    best_wt = np.zeros((tex_size, tex_size),    np.float32)
+
+    ty_all, tx_all = np.where(valid_mask)
+    P_flat = pos_map[ty_all, tx_all]
+    N_flat = normal_map[ty_all, tx_all]
+    N_flat = N_flat / (np.linalg.norm(N_flat, axis=1, keepdims=True) + 1e-10)
+
+    for ci, cam in enumerate(cameras):
+        col     = _COLORS[ci % len(_COLORS)]
+        cam_pos = np.array(cam["pos"], dtype=float)
+        view    = cam["view"]
+        proj    = cam["proj"]
+
+        vd   = cam_pos - P_flat
+        vd_n = vd / (np.linalg.norm(vd, axis=1, keepdims=True) + 1e-10)
+        dots = (N_flat * vd_n).sum(axis=1)
+
+        P_h    = np.concatenate([P_flat, np.ones((len(P_flat), 1))], axis=1)
+        P_cam  = (view @ P_h.T).T
+        P_clip = (proj @ P_cam.T).T
+        w      = P_clip[:, 3]
+        ndc    = P_clip[:, :3] / (w[:, None] + 1e-10)
+        in_frustum = ((ndc[:, 0] >= -1) & (ndc[:, 0] <= 1) &
+                      (ndc[:, 1] >= -1) & (ndc[:, 1] <= 1))
+        valid  = (dots > 0.0) & (w > 1e-6) & in_frustum
+        if not valid.any():
+            continue
+
+        w_ang = np.where(valid, dots, 0.0)
+        idx   = np.where(valid)[0]
+        ty_v, tx_v, w_v = ty_all[idx], tx_all[idx], w_ang[idx]
+        update = w_v > best_wt[ty_v, tx_v]
+        best_wt[ty_v[update], tx_v[update]] = w_v[update]
+        tex[ty_v[update], tx_v[update]]     = col
+
+    return Image.fromarray(tex, "RGB")
+
+
 # ── Mesh export ───────────────────────────────────────────────────────────────
 
 def export_textured_mesh(mesh, uv, texture_img, output_dir, fmt):
@@ -1089,6 +1206,9 @@ def export_textured_mesh(mesh, uv, texture_img, output_dir, fmt):
     elif fmt == "obj":
         out_path = os.path.join(output_dir, "textured_mesh.obj")
         mesh_out.export(out_path)
+    elif fmt in ("usd", "usda", "usdc", "usdz"):
+        out_path = os.path.join(output_dir, f"textured_mesh.{fmt}")
+        mesh_out.export(out_path)  # requires usd-core or pxr
     else:
         print(f"[standalone] Unknown export format: {fmt}", file=sys.stderr)
         return
@@ -1123,10 +1243,10 @@ def _parse_args():
     p.add_argument("--server",              metavar="ADDR",    default="127.0.0.1:8188")
     p.add_argument("--output",              metavar="DIR",     default="./sg_out")
     p.add_argument("--export",              metavar="FORMAT",  default="glb",
-                   choices=["glb", "obj", "none"])
+                   choices=["glb", "obj", "usd", "usda", "usdc", "usdz", "none"])
     p.add_argument("--no-controlnet",       action="store_true")
     p.add_argument("--controlnet",          metavar="MODEL",
-                   default="control-lora-depth-rank128.safetensors")
+                   default="controlnet_depth_sdxl.safetensors")
     p.add_argument("--controlnet-strength", type=float,        default=0.6)
     p.add_argument("--save-views",          action="store_true")
     p.add_argument("--spherical-uv",        action="store_true",
@@ -1209,14 +1329,25 @@ def main():
 
     # 2. Load mesh
     print(f"[standalone] Loading mesh ...")
-    raw = trimesh.load(args.mesh, process=False)
-    if isinstance(raw, trimesh.Scene):
-        parts = list(raw.geometry.values())
-        mesh = trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
+    ext = os.path.splitext(args.mesh)[1].lower()
+    if ext in _USD_EXTENSIONS:
+        try:
+            mesh = _load_usd_mesh(args.mesh)
+        except RuntimeError as e:
+            print(f"[standalone] ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            print(f"[standalone] ERROR: failed to load USD file: {e}", file=sys.stderr)
+            sys.exit(1)
     else:
-        mesh = raw
-    if not isinstance(mesh, trimesh.Trimesh):
-        mesh = trimesh.util.concatenate(mesh.dump()) if hasattr(mesh, "dump") else trimesh.Trimesh()
+        raw = trimesh.load(args.mesh, process=False)
+        if isinstance(raw, trimesh.Scene):
+            parts = list(raw.geometry.values())
+            mesh = trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
+        else:
+            mesh = raw
+        if not isinstance(mesh, trimesh.Trimesh):
+            mesh = trimesh.util.concatenate(mesh.dump()) if hasattr(mesh, "dump") else trimesh.Trimesh()
 
     if not isinstance(mesh, trimesh.Trimesh):
         print("[standalone] ERROR: could not load a Trimesh", file=sys.stderr)
@@ -1311,8 +1442,12 @@ def main():
 
     # 6. Build UV map and bake
     pos_map, normal_map, valid_mask = build_uv_3d_map(mesh, uv, args.tex_size)
-    texture = bake_texture(pos_map, normal_map, valid_mask,
-                           cameras, gen_images, args.tex_size)
+    texture  = bake_texture(pos_map, normal_map, valid_mask,
+                            cameras, gen_images, args.tex_size)
+    coverage = bake_coverage_texture(pos_map, normal_map, valid_mask,
+                                     cameras, args.tex_size)
+    coverage.save(os.path.join(args.output, "coverage.png"))
+    print("[standalone] Coverage texture saved: coverage.png")
 
     # 7. Optional texture upscale
     if args.upscale_result:
@@ -1328,7 +1463,8 @@ def main():
     if args.view:
         view_result(mesh, uv, texture,
                     warnings=view_warnings or None,
-                    gen_images=gen_images)
+                    gen_images=gen_images,
+                    coverage_texture=coverage)
 
 
 if __name__ == "__main__":

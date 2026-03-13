@@ -74,7 +74,7 @@ def _parse_args():
     p.add_argument("--server",       metavar="ADDR",   default="127.0.0.1:8188")
     p.add_argument("--output",       metavar="DIR",    default="./stablegen_out")
     p.add_argument("--export",       metavar="FORMAT", default="none",
-                   choices=["glb", "fbx", "obj", "none"])
+                   choices=["glb", "fbx", "obj", "usd", "usdz", "none"])
     p.add_argument("--bake",         action="store_true")
     p.add_argument("--no-controlnet",action="store_true")
     p.add_argument("--architecture", metavar="ARCH",   default="sdxl",
@@ -340,6 +340,9 @@ def _export(objects, output_dir, fmt):
             bpy.ops.export_scene.fbx(filepath=out_path, use_selection=True)
         elif fmt == "obj":
             bpy.ops.wm.obj_export(filepath=out_path, export_selected_objects=True)
+        elif fmt in ("usd", "usdz"):
+            bpy.ops.wm.usd_export(filepath=out_path, selected_objects_only=True,
+                                  export_textures=True, export_materials=True)
         print(f"[stablegen_cli] Exported: {out_path}")
     except Exception as e:
         print(f"[stablegen_cli] Export failed: {e}", file=sys.stderr)

@@ -6588,6 +6588,10 @@ class ExportForGameEngine(bpy.types.Operator):
              'Separate .gltf, .bin and texture files'),
             ('FBX', 'FBX (.fbx)',
              'Autodesk FBX with embedded textures — Unreal Engine'),
+            ('USDC', 'USD Binary (.usdc)',
+             'Universal Scene Description binary — Houdini, Maya, Omniverse'),
+            ('USDZ', 'USD Zip (.usdz)',
+             'Universal Scene Description archive — Apple AR, iOS, visionOS'),
         ],
         default='GLB'
     ) # type: ignore
@@ -6666,6 +6670,10 @@ class ExportForGameEngine(bpy.types.Operator):
             ext = ".fbx"
         elif self.export_format == 'GLTF_SEPARATE':
             ext = ".gltf"
+        elif self.export_format == 'USDC':
+            ext = ".usdc"
+        elif self.export_format == 'USDZ':
+            ext = ".usdz"
         else:
             ext = ".glb"
         filepath = os.path.join(output_base, f"{base_name}{ext}")
@@ -6689,6 +6697,14 @@ class ExportForGameEngine(bpy.types.Operator):
                     export_tangents=True,
                     export_yup=True,
                     export_apply=False,
+                    export_animations=self.export_animations,
+                )
+            elif self.export_format in ('USDC', 'USDZ'):
+                bpy.ops.wm.usd_export(
+                    filepath=filepath,
+                    selected_objects_only=True,
+                    export_textures=True,
+                    export_materials=True,
                     export_animations=self.export_animations,
                 )
             else:  # FBX

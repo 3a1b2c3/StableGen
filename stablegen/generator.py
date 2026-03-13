@@ -460,6 +460,23 @@ def upload_image_to_comfyui(server_address, image_path, image_type="input"):
 
     return None
 
+
+def _is_blank_image(path, threshold=5):
+    """Return True if the image at *path* is effectively uniform (all one colour).
+
+    A depth map rendered by the Blender compositor when the Z-pass contains no
+    data comes out as solid white (all pixels ≈ 255).  We detect this by
+    checking that the per-channel standard deviation across all pixels is below
+    *threshold* (default 5, on a 0-255 scale).
+    """
+    try:
+        with Image.open(path) as img:
+            arr = np.array(img.convert("L"), dtype=np.float32)
+            return float(arr.std()) < threshold
+    except Exception:
+        return False
+
+
 class ComfyUIGenerate(bpy.types.Operator):
     """Generate textures using ComfyUI (to all mesh objects using all cameras in the scene)
     
@@ -485,6 +502,7 @@ class ComfyUIGenerate(bpy.types.Operator):
     _original_visibility = None
     _generation_method_on_start = None
     _uploaded_images_cache: dict = {}
+    _depth_maps_broken: bool = False
     workflow_manager: object = None
 
     # Add properties to track progress
@@ -1111,6 +1129,22 @@ class ComfyUIGenerate(bpy.types.Operator):
                         lambda: self.combine_maps(context, cameras, type="depth"))
                     if self._error:
                         return
+
+                # Check whether ALL rendered depth maps are blank (uniform colour).
+                # This happens when the Blender compositor Z-pass produces no data,
+                # which results in a solid-white image after Normalize → Invert.
+                depth_paths = [
+                    get_file_path(context, "controlnet", subtype="depth",
+                                  camera_id=i, material_id=self._material_id)
+                    for i in range(len(cameras))
+                ]
+                existing = [p for p in depth_paths if os.path.isfile(p)]
+                if existing and all(_is_blank_image(p) for p in existing):
+                    self._depth_maps_broken = True
+                    print("[StableGen] WARNING: All depth maps are blank — "
+                          "depth ControlNet will be skipped for this run.")
+                else:
+                    self._depth_maps_broken = False
 
             need_canny = any(u["unit_type"] == "canny" for u in controlnet_units)
             if need_canny and context.scene.generation_method != 'uv_inpaint':
@@ -3553,6 +3587,9 @@ class ComfyUIGenerate(bpy.types.Operator):
         Returns:
             dict: Upload info from ComfyUI (containing 'name', etc.) or None if failed/not found.
         """
+        if subtype == "depth" and getattr(self, '_depth_maps_broken', False):
+            return None
+
         effective_material_id = material_id
 
         # Use the existing get_file_path to determine the canonical local path

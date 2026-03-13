@@ -2,8 +2,11 @@
 Interactive pygame/OpenGL viewers for StableGen standalone.
 
 Functions:
-    view_result(mesh, uv, texture_img, warnings=None)
+    view_result(mesh, uv, texture_img, warnings=None, gen_images=None)
         Open a textured-mesh viewer window.
+
+    view_images_flat(gen_images)
+        Show all generated camera images in a flat 2-D grid window.
 
     view_cameras(mesh, cameras)
         Open a camera-placement preview window.
@@ -26,7 +29,7 @@ _CAM_COLORS = [
 
 # ── Interactive viewer ────────────────────────────────────────────────────────
 
-def view_result(mesh, uv, texture_img, warnings=None, gen_images=None):
+def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_texture=None):
     """
     Open a pygame/OpenGL window showing the textured mesh with a HUD overlay.
     Controls: left-drag = orbit, scroll = zoom, Esc/Q = close.
@@ -59,6 +62,12 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None):
         print("[view] Install: .\\venv\\Scripts\\python.exe -m pip install pygame PyOpenGL",
               file=sys.stderr)
         return
+
+    # PyOpenGL bug: glGenTextures(1) uses a ctypes scalar that ctypes converts to
+    # an unregistered <cparam 'P'> pointer type.  count=2 takes the numpy array
+    # path instead and always works; we just use the first ID.
+    def _gen_tex():
+        return int(glGenTextures(2)[0])
 
     # ── Normalise mesh to unit cube centred at origin ──────────────────────────
     verts   = np.array(mesh.vertices,       dtype=np.float32)
@@ -95,23 +104,35 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None):
     gluPerspective(45.0, W / (H - STRIP_H), 0.01, 100.0)
     glMatrixMode(GL_MODELVIEW)
 
-    mesh_tex_id = glGenTextures(1)
-    glBindTexture(GL_TEXTURE_2D, mesh_tex_id)
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tex_w, tex_h,
-                 0, GL_RGBA, GL_UNSIGNED_BYTE, tex_rgba.tobytes())
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    def _upload_tex(rgba_arr):
+        h, w = rgba_arr.shape[:2]
+        tid = _gen_tex()
+        glBindTexture(GL_TEXTURE_2D, tid)
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h,
+                     0, GL_RGBA, GL_UNSIGNED_BYTE, rgba_arr.tobytes())
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        return tid
+
+    mesh_tex_id = _upload_tex(tex_rgba)
+
+    coverage_tex_id = None
+    if coverage_texture is not None:
+        cov_rgba = np.ascontiguousarray(
+            np.flipud(np.array(coverage_texture.convert("RGBA"), dtype=np.uint8))
+        )
+        coverage_tex_id = _upload_tex(cov_rgba)
 
     glEnable(GL_DEPTH_TEST)
     glEnable(GL_LIGHTING)
     glEnable(GL_LIGHT0)
     glEnable(GL_NORMALIZE)
     glEnable(GL_TEXTURE_2D)
-    glLightfv(GL_LIGHT0, GL_POSITION, [2.0, 3.0, 2.0, 0.0])
-    glLightfv(GL_LIGHT0, GL_DIFFUSE,  [0.85, 0.85, 0.85, 1.0])
-    glLightfv(GL_LIGHT0, GL_AMBIENT,  [0.35, 0.35, 0.35, 1.0])
-    glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE, [1.0, 1.0, 1.0, 1.0])
+    glLightfv(GL_LIGHT0, GL_POSITION, np.array([2.0, 3.0, 2.0, 0.0], dtype=np.float32))
+    glLightfv(GL_LIGHT0, GL_DIFFUSE,  np.array([0.85, 0.85, 0.85, 1.0], dtype=np.float32))
+    glLightfv(GL_LIGHT0, GL_AMBIENT,  np.array([0.35, 0.35, 0.35, 1.0], dtype=np.float32))
+    glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE, np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32))
     glClearColor(0.13, 0.13, 0.13, 1.0)
 
     # ── Upload generated camera thumbnails ─────────────────────────────────────
@@ -125,7 +146,7 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None):
             # Image thumbnail
             thumb = img.resize((THUMB, THUMB)).convert("RGBA")
             td = np.ascontiguousarray(np.flipud(np.array(thumb, dtype=np.uint8)))
-            tid = glGenTextures(1)
+            tid = _gen_tex()
             glBindTexture(GL_TEXTURE_2D, tid)
             glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, THUMB, THUMB,
@@ -136,7 +157,7 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None):
             lsurf = font_th.render(f"Cam {ci+1}", True, (200, 200, 200))
             ldata = pygame.image.tostring(lsurf, "RGBA", True)
             lw, lh = lsurf.get_size()
-            lid = glGenTextures(1)
+            lid = _gen_tex()
             glBindTexture(GL_TEXTURE_2D, lid)
             glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, lw, lh,
@@ -153,7 +174,7 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None):
         """Upload a pygame Surface as an RGBA GL texture; return (id, w, h)."""
         data = pygame.image.tostring(surf, "RGBA", True)
         sw, sh = surf.get_size()
-        tid = glGenTextures(1)
+        tid = _gen_tex()
         glBindTexture(GL_TEXTURE_2D, tid)
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, sw, sh,
@@ -219,25 +240,29 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None):
         glMatrixMode(GL_MODELVIEW)
         glPopMatrix()
 
-    # ── Build static HUD content ───────────────────────────────────────────────
-    info_lines = [
-        f"Verts: {len(mesh.vertices):,}   Faces: {len(mesh.faces):,}",
-        f"Texture: {texture_img.width} x {texture_img.height}",
-        "Drag: orbit   Scroll: zoom   Q: quit",
-    ]
+    # ── Interaction state ──────────────────────────────────────────────────────
+    yaw, pitch   = 30.0, -20.0
+    zoom         = -3.0
+    dragging     = False
+    last_mouse   = None
+    clock        = pygame.time.Clock()
+    fps          = 0
+    hud_tid      = None
+    hud_w = hud_h = 0
+    show_coverage = False   # T toggles between texture / coverage
+
+    def _make_info_lines():
+        mode = "coverage" if show_coverage else "texture"
+        t_hint = "T: show texture" if show_coverage else "T: show coverage"
+        return [
+            f"Verts: {len(mesh.vertices):,}   Faces: {len(mesh.faces):,}",
+            f"Mode: {mode}   {t_hint}",
+            "Drag: orbit   Scroll: zoom   Q: quit",
+        ]
+
     warn_lines = list(warnings) if warnings else []
 
-    # ── Interaction state ──────────────────────────────────────────────────────
-    yaw, pitch = 30.0, -20.0
-    zoom       = -3.0
-    dragging   = False
-    last_mouse = None
-    clock      = pygame.time.Clock()
-    fps        = 0
-    hud_tid    = None
-    hud_w = hud_h = 0
-
-    print("[view] Window open — drag to orbit, scroll to zoom, Q/Esc to close")
+    print("[view] Window open — drag to orbit, scroll to zoom, T: coverage, Q/Esc to close")
     if warn_lines:
         for w in warn_lines:
             print(f"[view] WARNING: {w}")
@@ -250,6 +275,9 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None):
             elif event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
                     running = False
+                elif event.key == pygame.K_t and coverage_tex_id is not None:
+                    show_coverage = not show_coverage
+                    hud_tid = None   # force HUD rebuild
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
                     dragging, last_mouse = True, event.pos
@@ -275,7 +303,8 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None):
         glRotatef(pitch, 1, 0, 0)
         glRotatef(yaw,   0, 1, 0)
 
-        glBindTexture(GL_TEXTURE_2D, mesh_tex_id)
+        active_tex = coverage_tex_id if (show_coverage and coverage_tex_id) else mesh_tex_id
+        glBindTexture(GL_TEXTURE_2D, active_tex)
         glBegin(GL_TRIANGLES)
         for face in faces:
             for vi in face:
@@ -284,13 +313,13 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None):
                 glVertex3fv(verts[vi])
         glEnd()
 
-        # ── HUD overlay (rebuilt each second for live FPS) ─────────────────────
+        # ── HUD overlay (rebuilt on mode change or each second for live FPS) ────
         new_fps = int(clock.get_fps())
         if hud_tid is None or new_fps != fps:
             if hud_tid is not None:
                 glDeleteTextures([hud_tid])
             fps = new_fps
-            hud_tid, hud_w, hud_h = _make_hud_texture(info_lines, warn_lines, fps)
+            hud_tid, hud_w, hud_h = _make_hud_texture(_make_info_lines(), warn_lines, fps)
 
         _draw_hud_quad(hud_tid, hud_w, hud_h, x=10, y=10)
 
@@ -367,26 +396,29 @@ def view_cameras(mesh, cameras):
         from pygame.locals import DOUBLEBUF, OPENGL
         from OpenGL.GL import (
             GL_AMBIENT, GL_AMBIENT_AND_DIFFUSE, GL_BLEND,
-            GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_DEPTH_TEST,
-            GL_DIFFUSE, GL_FILL, GL_FRONT_AND_BACK, GL_LIGHT0, GL_LIGHTING,
-            GL_LINES, GL_LINEAR, GL_MODELVIEW, GL_NORMALIZE,
+            GL_COLOR_BUFFER_BIT, GL_COLOR_MATERIAL, GL_DEPTH_BUFFER_BIT,
+            GL_DEPTH_TEST, GL_DIFFUSE, GL_FILL, GL_FRONT_AND_BACK, GL_LIGHT0,
+            GL_LIGHTING, GL_LINES, GL_LINEAR, GL_MODELVIEW, GL_NORMALIZE,
             GL_ONE_MINUS_SRC_ALPHA, GL_POINTS, GL_POLYGON_OFFSET_FILL,
             GL_POSITION, GL_PROJECTION, GL_QUADS, GL_RGBA, GL_SRC_ALPHA,
             GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER,
             GL_TRIANGLES, GL_UNPACK_ALIGNMENT, GL_UNSIGNED_BYTE,
             glBegin, glBindTexture, glBlendFunc, glClear, glClearColor,
-            glColor3f, glColor4f, glDeleteTextures, glDisable, glEnable,
-            glEnd, glGenTextures, glLightfv, glLineWidth, glLoadIdentity,
-            glMaterialfv, glMatrixMode, glNormal3fv, glOrtho, glPixelStorei,
-            glPointSize, glPolygonMode, glPolygonOffset, glPopMatrix,
-            glPushMatrix, glRotatef, glTexCoord2f, glTexImage2D,
-            glTexParameteri, glTranslatef, glVertex3f, glVertex3fv,
-            glVertex2f,
+            glColor3f, glColor4f, glColorMaterial, glDeleteTextures,
+            glDisable, glEnable, glEnd, glGenTextures, glLightfv, glLineWidth,
+            glLoadIdentity, glMaterialfv, glMatrixMode, glNormal3fv, glOrtho,
+            glPixelStorei, glPointSize, glPolygonMode, glPolygonOffset,
+            glPopMatrix, glPushMatrix, glRotatef, glTexCoord2f, glTexImage2D,
+            glTexParameteri, glTranslatef, glVertex3f, glVertex3fv, glVertex2f,
         )
         from OpenGL.GLU import gluPerspective
     except ImportError as e:
         print(f"[camera-gui] pygame/PyOpenGL not available: {e}", file=sys.stderr)
         return True   # proceed anyway
+
+    # Same glGenTextures(1) bug workaround as view_result.
+    def _gen_tex():
+        return int(glGenTextures(2)[0])
 
     # ── Mesh geometry ──────────────────────────────────────────────────────────
     verts   = np.array(mesh.vertices,       dtype=np.float32)
@@ -398,6 +430,8 @@ def view_cameras(mesh, cameras):
     scale    = np.abs(verts).max()
     if scale > 0:
         verts /= scale
+
+    face_normals_raw = np.array(mesh.face_normals, dtype=np.float32)
 
     cam_positions = []
     cam_frustums  = []
@@ -424,6 +458,22 @@ def view_cameras(mesh, cameras):
         ]
         cam_frustums.append((tip, corners))
 
+    # ── Face → best camera assignment (for coverage colouring) ────────────────
+    # For each face pick the camera whose direction most faces the face normal.
+    # "Direction toward face" ≈ negative of the normalised camera position
+    # (cameras orbit and look at the centroid/origin).
+    if cam_positions:
+        cam_dirs = np.array(
+            [-p / (np.linalg.norm(p) + 1e-8) for p in cam_positions],
+            dtype=np.float32,
+        )                                       # (C, 3)
+        scores   = face_normals_raw @ cam_dirs.T  # (F, C)
+        face_cam = np.argmax(scores, axis=1)      # (F,) best camera index
+        face_max = scores[np.arange(len(scores)), face_cam]
+    else:
+        face_cam = np.zeros(len(faces), dtype=np.int32)
+        face_max = np.ones(len(faces), dtype=np.float32)
+
     # ── pygame / OpenGL init ───────────────────────────────────────────────────
     W, H = 900, 700
     pygame.init()
@@ -440,10 +490,10 @@ def view_cameras(mesh, cameras):
     glEnable(GL_LIGHTING)
     glEnable(GL_LIGHT0)
     glEnable(GL_NORMALIZE)
-    glLightfv(GL_LIGHT0, GL_POSITION, [2.0, 3.0, 2.0, 0.0])
-    glLightfv(GL_LIGHT0, GL_DIFFUSE,  [0.75, 0.75, 0.75, 1.0])
-    glLightfv(GL_LIGHT0, GL_AMBIENT,  [0.30, 0.30, 0.30, 1.0])
-    glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE, [0.55, 0.55, 0.60, 1.0])
+    glLightfv(GL_LIGHT0, GL_POSITION, np.array([2.0, 3.0, 2.0, 0.0], dtype=np.float32))
+    glLightfv(GL_LIGHT0, GL_DIFFUSE,  np.array([0.75, 0.75, 0.75, 1.0], dtype=np.float32))
+    glLightfv(GL_LIGHT0, GL_AMBIENT,  np.array([0.30, 0.30, 0.30, 1.0], dtype=np.float32))
+    glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE, np.array([0.55, 0.55, 0.60, 1.0], dtype=np.float32))
     glClearColor(0.10, 0.10, 0.10, 1.0)
 
     # ── HUD helpers ───────────────────────────────────────────────────────────
@@ -453,7 +503,7 @@ def view_cameras(mesh, cameras):
     def _surface_to_gl(surf):
         data = pygame.image.tostring(surf, "RGBA", True)
         sw, sh = surf.get_size()
-        tid = glGenTextures(1)
+        tid = _gen_tex()
         glBindTexture(GL_TEXTURE_2D, tid)
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, sw, sh,
@@ -554,18 +604,28 @@ def view_cameras(mesh, cameras):
         glRotatef(pitch, 1, 0, 0)
         glRotatef(yaw,   0, 1, 0)
 
-        # ── Mesh (solid, slightly recessed so wireframe sits on top) ──────────
+        # ── Mesh (solid, coloured by best-covering camera) ─────────────────────
         glEnable(GL_LIGHTING)
+        glEnable(GL_COLOR_MATERIAL)
+        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
         glDisable(GL_TEXTURE_2D)
         glEnable(GL_POLYGON_OFFSET_FILL)
         glPolygonOffset(1.0, 1.0)
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
         glBegin(GL_TRIANGLES)
-        for face in faces:
+        for fi, face in enumerate(faces):
+            ci  = int(face_cam[fi])
+            col = _CAM_COLORS[ci % len(_CAM_COLORS)]
+            # Dim backfaces (score ≤ 0) so uncovered areas stay dark
+            if face_max[fi] > 0:
+                glColor3f(*col)
+            else:
+                glColor3f(0.25, 0.25, 0.28)
             for vi in face:
                 glNormal3fv(normals[vi])
                 glVertex3fv(verts[vi])
         glEnd()
+        glDisable(GL_COLOR_MATERIAL)
         glDisable(GL_POLYGON_OFFSET_FILL)
 
         # ── Camera markers ─────────────────────────────────────────────────────

@@ -11,6 +11,6 @@ pyrender
 # stablegen_standalone.py — optional (pygame viewer / camera GUI)
 pygame
 PyOpenGL
-
+pyglet 
 # stablegen_standalone.py — optional (better UV unwrap)
 # xatlas
