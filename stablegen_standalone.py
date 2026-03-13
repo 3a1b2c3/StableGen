@@ -930,13 +930,15 @@ def upscale_texture(server, texture_img, upscale_model, save_dir=None):
         image_name = info.get("name", os.path.basename(tmp))
         wf = _build_upscale_workflow(image_name, upscale_model)
         result = _run_workflow(server, wf)
-        if result is None:
+        if not result:
             print("[upscale] Workflow returned no image — skipping upscale",
                   file=sys.stderr)
             return texture_img
+        img_bytes = next(iter(result.values()))[0]
+        result_img = Image.open(BytesIO(img_bytes)).convert("RGB")
         print(f"[upscale] {texture_img.size[0]}x{texture_img.size[1]}"
-              f" → {result.size[0]}x{result.size[1]}  (model: {upscale_model})")
-        return result
+              f" → {result_img.size[0]}x{result_img.size[1]}  (model: {upscale_model})")
+        return result_img
     except Exception as e:
         print(f"[upscale] Failed: {e} — keeping original texture", file=sys.stderr)
         return texture_img
@@ -1042,7 +1044,7 @@ def _find_mesh_texture(mesh_path):
         try:
             if p.lower().endswith(".dds"):
                 try:
-                    import imageio  # type: ignore
+                    import imageio.v2 as imageio  # type: ignore
                     arr = imageio.imread(p)
                     return Image.fromarray(arr).convert("RGB")
                 except Exception:
@@ -1716,6 +1718,7 @@ def main():
         )
 
         _build_fn = lambda n, mode: build_cameras(mesh, n, mode, args.width, args.height)
+        print(f"[camera-gui] Opening GUI with {len(_saved_cameras)} cameras ...")
         proceed, cameras = view_cameras(
             mesh, _saved_cameras,
             build_fn=_build_fn,
