@@ -648,6 +648,13 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
             },
         ]
     },
+    # --- Upscale Models ---
+    "model_4x_ultrasharp": {
+        "id": "model_4x_ultrasharp", "type": "model", "name": "4x-UltraSharp Upscale Model",
+        "url": "https://huggingface.co/lokCX/4x-Ultrasharp/resolve/main/4x-UltraSharp.pth",
+        "target_path_relative": "models/upscale_models", "filename": "4x-UltraSharp.pth",
+        "license": "Unknown", "size_mb": 67, "packages": ["upscale_ultrasharp"]
+    },
     # --- FLUX.2 Klein 4B ---
     "model_flux2_klein_4b": {
         "id": "model_flux2_klein_4b", "type": "model",
@@ -724,6 +731,12 @@ MENU_PACKAGES: Dict[str, Dict[str, Any]] = {
         "size_gb": 3.3,
         "description_suffix": "*Installs ComfyUI_StableDelight_ll custom node + downloads the*\n"
                               "    *Stable-X/yoso-delight-v0-4-base model (~3.3GB fp16) for specular-free albedo.*",
+    },
+    '12': {"name": "[UPSCALE] 4x-UltraSharp Upscale Model (~67 MB)",
+        "tags": ["upscale_ultrasharp"],
+        "size_gb": 0.07,
+        "description_suffix": "*Downloads 4x-UltraSharp.pth into ComfyUI models/upscale_models/.*\n"
+                              "    *Used by stablegen_standalone.py --upscale-result / --upscale-texture.*",
     },
     '11': {"name": "[FLUX.2 KLEIN] Klein 4B FP8 + Qwen 3 Text Encoder + VAE",
         "tags": ["flux2_klein"],

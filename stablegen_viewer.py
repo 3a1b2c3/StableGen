@@ -43,18 +43,19 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
         from OpenGL.GL import (
             GL_AMBIENT, GL_AMBIENT_AND_DIFFUSE, GL_BLEND,
             GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT, GL_DEPTH_TEST,
-            GL_DIFFUSE, GL_FRONT_AND_BACK, GL_LIGHT0, GL_LIGHTING,
-            GL_LINEAR, GL_MODELVIEW, GL_NORMALIZE, GL_ONE_MINUS_SRC_ALPHA,
+            GL_COLOR_MATERIAL, GL_DIFFUSE, GL_FRONT_AND_BACK, GL_LIGHT0,
+            GL_LIGHTING, GL_LINES, GL_LINEAR, GL_MODELVIEW, GL_NORMALIZE,
+            GL_ONE_MINUS_SRC_ALPHA, GL_POLYGON_OFFSET_FILL,
             GL_POSITION, GL_PROJECTION, GL_QUADS, GL_RGBA, GL_SRC_ALPHA,
             GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER,
             GL_TRIANGLES, GL_UNPACK_ALIGNMENT, GL_UNSIGNED_BYTE,
             glBegin, glBindTexture, glBlendFunc, glClear, glClearColor,
             glColor4f, glDeleteTextures, glDisable, glEnable, glEnd,
-            glGenTextures, glLightfv, glLoadIdentity, glMaterialfv,
+            glGenTextures, glLightfv, glLineWidth, glLoadIdentity, glMaterialfv,
             glMatrixMode, glNormal3fv, glOrtho, glPixelStorei,
-            glPopMatrix, glPushMatrix, glRotatef, glTexCoord2f,
+            glPolygonOffset, glPopMatrix, glPushMatrix, glRotatef, glTexCoord2f,
             glTexCoord2fv, glTexImage2D, glTexParameteri, glTranslatef,
-            glVertex2f, glVertex3fv,
+            glVertex2f, glVertex3f, glVertex3fv,
         )
         from OpenGL.GLU import gluPerspective
     except ImportError as e:
@@ -80,6 +81,22 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
     if scale > 0:
         verts /= scale
 
+    # Unique mesh edges for wireframe overlay
+    _edge_count = {}
+    for tri in faces:
+        for i in range(3):
+            a, b = int(tri[i]), int(tri[(i+1) % 3])
+            key = (min(a, b), max(a, b))
+            _edge_count[key] = _edge_count.get(key, 0) + 1
+    mesh_edges = np.array(list(_edge_count.keys()), dtype=np.int32)   # (E, 2)
+
+    # UV island boundary edges for the 2D inset: boundary edges (count==1) in UV space.
+    # Stored as pairs of UV pixel coords for fast drawing.
+    _uv_seam_pairs = []   # list of (uv_a, uv_b) float pairs in [0,1]
+    for (a, b), cnt in _edge_count.items():
+        if cnt == 1:
+            _uv_seam_pairs.append((uv_arr[a], uv_arr[b]))
+
     # ── Upload mesh texture ────────────────────────────────────────────────────
     # PIL row-0 = top; OpenGL row-0 = bottom → flip so UV v=0 is bottom.
     tex_rgba = np.ascontiguousarray(
@@ -92,16 +109,18 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
     T_PAD   = 6           # gap between thumbnails / border
     T_LABEL = 16          # label height below each thumbnail
     STRIP_H = THUMB + T_PAD * 2 + T_LABEL if gen_images else 0
+    BTN_BAR_H = 36        # toggle button bar height
 
     # ── pygame / OpenGL init ───────────────────────────────────────────────────
-    W, H = 900, 700 + STRIP_H
+    W, H = 900, 700 + BTN_BAR_H + STRIP_H
+    VIEW_H = 700          # 3D viewport height
     pygame.init()
     pygame.display.set_mode((W, H), DOUBLEBUF | OPENGL)
-    pygame.display.set_caption("StableGen — textured mesh")
+    pygame.display.set_caption("StableGen -- textured mesh")
 
     glMatrixMode(GL_PROJECTION)
     glLoadIdentity()
-    gluPerspective(45.0, W / (H - STRIP_H), 0.01, 100.0)
+    gluPerspective(45.0, W / VIEW_H, 0.01, 100.0)
     glMatrixMode(GL_MODELVIEW)
 
     def _upload_tex(rgba_arr):
@@ -184,7 +203,9 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
         return tid, sw, sh
 
     def _make_hud_texture(info_lines, warn_lines, fps):
-        """Render HUD lines to a pygame Surface and upload as GL texture."""
+        """Render HUD lines to a pygame Surface and upload as GL texture.
+        info_lines: list of str  OR  list of (str, rgb_tuple).
+        """
         COL_INFO  = (210, 210, 210)
         COL_WARN  = (255, 200,  60)
         COL_FPS   = (120, 220, 120)
@@ -192,7 +213,11 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
 
         rendered = []
         for line in info_lines:
-            rendered.append(font_sm.render(line, True, COL_INFO))
+            if isinstance(line, tuple):
+                text, col = line
+            else:
+                text, col = line, COL_INFO
+            rendered.append(font_sm.render(text, True, col))
         for line in warn_lines:
             rendered.append(font_warn.render(f"! {line}", True, COL_WARN))
         rendered.append(font_sm.render(f"FPS {fps:3d}", True, COL_FPS))
@@ -240,6 +265,89 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
         glMatrixMode(GL_MODELVIEW)
         glPopMatrix()
 
+    _btn_font = pygame.font.SysFont("consolas", 13, bold=True)
+
+    def _draw_btn_bar():
+        """Draw the toggle button bar between the 3D view and thumbnail strip."""
+        bar_y = VIEW_H   # top of button bar in window coords
+        mx, my = pygame.mouse.get_pos()
+
+        glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+        glOrtho(0, W, H, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity()
+        glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING)
+        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glDisable(GL_TEXTURE_2D)
+
+        # Background
+        glColor4f(0.10, 0.10, 0.14, 1.0)
+        glBegin(GL_QUADS)
+        glVertex2f(0, bar_y); glVertex2f(W, bar_y)
+        glVertex2f(W, bar_y + BTN_BAR_H); glVertex2f(0, bar_y + BTN_BAR_H)
+        glEnd()
+
+        # Button definitions: (label, active_flag)
+        _cov_labels = ["Texture", "Overlay", "Coverage"]
+        btns = [
+            (_cov_labels[cov_mode], cov_mode > 0, "cov"),
+            ("Wireframe",           show_wireframe, "wf"),
+            ("UV Seams",            show_uvs,       "uv"),
+        ]
+        btn_w = W // len(btns)
+        for i, (label, active, tag) in enumerate(btns):
+            bx = i * btn_w
+            hover = (bx <= mx < bx + btn_w) and (bar_y <= my < bar_y + BTN_BAR_H)
+            if active:
+                r, g, b = (0.20, 0.55, 0.85)
+            elif hover:
+                r, g, b = (0.28, 0.28, 0.36)
+            else:
+                r, g, b = (0.16, 0.16, 0.22)
+            glDisable(GL_TEXTURE_2D)
+            glColor4f(r, g, b, 1.0)
+            glBegin(GL_QUADS)
+            glVertex2f(bx + 1,         bar_y + 2)
+            glVertex2f(bx + btn_w - 1, bar_y + 2)
+            glVertex2f(bx + btn_w - 1, bar_y + BTN_BAR_H - 2)
+            glVertex2f(bx + 1,         bar_y + BTN_BAR_H - 2)
+            glEnd()
+            col = (240, 240, 255) if active else (180, 180, 200)
+            surf = _btn_font.render(label, True, col)
+            tid, tw, th = _surface_to_gl_texture(surf)
+            tx = bx + (btn_w - tw) // 2
+            ty = bar_y + (BTN_BAR_H - th) // 2
+            glEnable(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, tid)
+            glColor4f(1, 1, 1, 1)
+            glBegin(GL_QUADS)
+            glTexCoord2f(0,1); glVertex2f(tx,      ty)
+            glTexCoord2f(1,1); glVertex2f(tx + tw, ty)
+            glTexCoord2f(1,0); glVertex2f(tx + tw, ty + th)
+            glTexCoord2f(0,0); glVertex2f(tx,      ty + th)
+            glEnd()
+            glDeleteTextures([tid])
+
+        glDisable(GL_BLEND); glDisable(GL_TEXTURE_2D)
+        glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING)
+        glMatrixMode(GL_PROJECTION); glPopMatrix()
+        glMatrixMode(GL_MODELVIEW);  glPopMatrix()
+
+    def _btn_bar_click(mx, my):
+        """Handle a click at (mx, my); return True if it hit a button."""
+        nonlocal cov_mode, show_wireframe, show_uvs
+        bar_y = VIEW_H
+        if not (bar_y <= my < bar_y + BTN_BAR_H):
+            return False
+        btn_w = W // 3
+        col = mx // btn_w
+        if col == 0:
+            cov_mode = (cov_mode + 1) % 3
+        elif col == 1:
+            show_wireframe = not show_wireframe
+        elif col == 2:
+            show_uvs = not show_uvs
+        return True
+
     # ── Interaction state ──────────────────────────────────────────────────────
     yaw, pitch   = 30.0, -20.0
     zoom         = -3.0
@@ -249,20 +357,34 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
     fps          = 0
     hud_tid      = None
     hud_w = hud_h = 0
-    show_coverage = False   # T toggles between texture / coverage
+    # 0 = texture only, 1 = texture + coverage overlay, 2 = coverage only
+    cov_mode      = 0
+    show_wireframe = False   # W toggles mesh edge overlay
+    show_uvs       = False   # U toggles UV edge overlay
 
     def _make_info_lines():
-        mode = "coverage" if show_coverage else "texture"
-        t_hint = "T: show texture" if show_coverage else "T: show coverage"
+        DIM   = (110, 110, 130)
+        ON    = (255, 255, 255)
+        OFF   = (130, 130, 150)
+        KEY   = ( 80, 160, 220)
+        cov_opts = ["Texture", "Overlay", "Coverage"]
+        cov_str = "  ".join(
+            f"[{o}]" if i == cov_mode else f" {o} "
+            for i, o in enumerate(cov_opts)
+        )
+        wf_str = f"Wireframe: {'ON ' if show_wireframe else 'off'}"
+        uv_str = f"UV Seams:  {'ON ' if show_uvs       else 'off'}"
         return [
-            f"Verts: {len(mesh.vertices):,}   Faces: {len(mesh.faces):,}",
-            f"Mode: {mode}   {t_hint}",
-            "Drag: orbit   Scroll: zoom   Q: quit",
+            (f"Verts: {len(mesh.vertices):,}   Faces: {len(mesh.faces):,}", DIM),
+            (f"T  {cov_str}",         ON  if cov_mode > 0 else OFF),
+            (f"W  {wf_str}",          ON  if show_wireframe else OFF),
+            (f"U  {uv_str}",          ON  if show_uvs       else OFF),
+            ("Drag: orbit   Scroll: zoom   Q: quit", DIM),
         ]
 
     warn_lines = list(warnings) if warnings else []
 
-    print("[view] Window open — drag to orbit, scroll to zoom, T: coverage, Q/Esc to close")
+    print("[view] Window open — drag to orbit, scroll to zoom, T: coverage, W: wireframe, U: UVs, Q/Esc to close")
     if warn_lines:
         for w in warn_lines:
             print(f"[view] WARNING: {w}")
@@ -276,11 +398,21 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
                 if event.key in (pygame.K_ESCAPE, pygame.K_q):
                     running = False
                 elif event.key == pygame.K_t and coverage_tex_id is not None:
-                    show_coverage = not show_coverage
-                    hud_tid = None   # force HUD rebuild
+                    cov_mode = (cov_mode + 1) % 3
+                    hud_tid = None
+                elif event.key == pygame.K_w:
+                    show_wireframe = not show_wireframe
+                    hud_tid = None
+                elif event.key == pygame.K_u:
+                    show_uvs = not show_uvs
+                    hud_tid = None
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
-                    dragging, last_mouse = True, event.pos
+                    mx, my = event.pos
+                    if _btn_bar_click(mx, my):
+                        hud_tid = None
+                    else:
+                        dragging, last_mouse = True, event.pos
                 elif event.button == 4:
                     zoom = min(zoom + 0.15, -0.3)
                 elif event.button == 5:
@@ -303,16 +435,109 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
         glRotatef(pitch, 1, 0, 0)
         glRotatef(yaw,   0, 1, 0)
 
-        active_tex = coverage_tex_id if (show_coverage and coverage_tex_id) else mesh_tex_id
-        glEnable(GL_TEXTURE_2D)
-        glBindTexture(GL_TEXTURE_2D, active_tex)
-        glBegin(GL_TRIANGLES)
-        for face in faces:
-            for vi in face:
-                glTexCoord2fv(uv_arr[vi])
-                glNormal3fv(normals[vi])
-                glVertex3fv(verts[vi])
-        glEnd()
+        def _draw_mesh_with_tex(tex_id, alpha=1.0):
+            glEnable(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, tex_id)
+            glColor4f(1, 1, 1, alpha)
+            glBegin(GL_TRIANGLES)
+            for face in faces:
+                for vi in face:
+                    glTexCoord2fv(uv_arr[vi])
+                    glNormal3fv(normals[vi])
+                    glVertex3fv(verts[vi])
+            glEnd()
+
+        if cov_mode == 2 and coverage_tex_id:
+            # Coverage only
+            _draw_mesh_with_tex(coverage_tex_id)
+        elif cov_mode == 1 and coverage_tex_id:
+            # Texture base + transparent coverage overlay
+            _draw_mesh_with_tex(mesh_tex_id)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glEnable(GL_POLYGON_OFFSET_FILL)
+            glPolygonOffset(-1.0, -1.0)
+            _draw_mesh_with_tex(coverage_tex_id, alpha=0.5)
+            glDisable(GL_POLYGON_OFFSET_FILL)
+            glDisable(GL_BLEND)
+        else:
+            # Texture only
+            _draw_mesh_with_tex(mesh_tex_id)
+
+        # ── Wireframe overlay (W) ──────────────────────────────────────────────
+        if show_wireframe:
+            glDisable(GL_TEXTURE_2D)
+            glDisable(GL_LIGHTING)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glEnable(GL_POLYGON_OFFSET_FILL)
+            glPolygonOffset(-1.0, -1.0)
+            glLineWidth(1.0)
+            glColor4f(0.0, 0.0, 0.0, 0.4)
+            glBegin(GL_LINES)
+            for a, b in mesh_edges:
+                glVertex3fv(verts[a])
+                glVertex3fv(verts[b])
+            glEnd()
+            glDisable(GL_POLYGON_OFFSET_FILL)
+            glDisable(GL_BLEND)
+            glEnable(GL_LIGHTING)
+            glEnable(GL_TEXTURE_2D)
+
+        # ── UV atlas inset (U) — 2D panel in top-right corner ────────────────
+        if show_uvs and _uv_seam_pairs:
+            INSET  = 220
+            MARGIN = 8
+            PAD    = 10
+            ix0 = W - INSET - PAD
+            iy0 = PAD
+
+            glDisable(GL_DEPTH_TEST)
+            glDisable(GL_LIGHTING)
+            glDisable(GL_TEXTURE_2D)
+            glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+            glOrtho(0, W, H, 0, -1, 1)
+            glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity()
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+            # Dark background
+            glColor4f(0.05, 0.05, 0.05, 0.85)
+            glBegin(GL_QUADS)
+            glVertex2f(ix0,        iy0)
+            glVertex2f(ix0+INSET,  iy0)
+            glVertex2f(ix0+INSET,  iy0+INSET)
+            glVertex2f(ix0,        iy0+INSET)
+            glEnd()
+
+            # Border
+            glColor4f(0.5, 0.5, 0.5, 0.8)
+            glLineWidth(1.0)
+            glBegin(GL_LINE_LOOP)
+            glVertex2f(ix0,        iy0)
+            glVertex2f(ix0+INSET,  iy0)
+            glVertex2f(ix0+INSET,  iy0+INSET)
+            glVertex2f(ix0,        iy0+INSET)
+            glEnd()
+
+            # UV island boundary edges
+            inner = INSET - MARGIN * 2
+            glColor4f(1.0, 0.85, 0.1, 0.9)
+            glLineWidth(1.5)
+            glBegin(GL_LINES)
+            for uva, uvb in _uv_seam_pairs:
+                ua, va = float(uva[0]), float(uva[1])
+                ub, vb = float(uvb[0]), float(uvb[1])
+                glVertex2f(ix0 + MARGIN + ua * inner, iy0 + MARGIN + (1.0 - va) * inner)
+                glVertex2f(ix0 + MARGIN + ub * inner, iy0 + MARGIN + (1.0 - vb) * inner)
+            glEnd()
+            glLineWidth(1.0)
+
+            glDisable(GL_BLEND)
+            glMatrixMode(GL_PROJECTION); glPopMatrix()
+            glMatrixMode(GL_MODELVIEW);  glPopMatrix()
+            glEnable(GL_DEPTH_TEST)
+            glEnable(GL_LIGHTING)
+            glEnable(GL_TEXTURE_2D)
 
         # ── HUD overlay (rebuilt on mode change or each second for live FPS) ────
         new_fps = int(clock.get_fps())
@@ -323,6 +548,7 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
             hud_tid, hud_w, hud_h = _make_hud_texture(_make_info_lines(), warn_lines, fps)
 
         _draw_hud_quad(hud_tid, hud_w, hud_h, x=10, y=10)
+        _draw_btn_bar()
 
         # ── Camera thumbnail strip ─────────────────────────────────────────────
         if thumb_ids:
@@ -712,24 +938,35 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
 
     def _make_hud(fps):
         PAD, LH = 6, 18
-        lines = []
-        r255  = lambda rgb: tuple(int(c * 255) for c in rgb)
+        DIM = (110, 110, 130)
+        ON  = (255, 255, 255)
+        OFF = (130, 130, 150)
+        r255 = lambda rgb: tuple(int(c * 255) for c in rgb)
+
         mode_name = _CAM_MODES[mode_idx][1] if build_fn else ""
-        lines.append((font_sm,   f"{len(cameras)} cameras  |  "
-                                  f"{len(mesh.vertices):,} verts  |  FPS {fps:3d}"
-                                  + (f"  |  {mode_name}" if build_fn else ""),
-                      (200, 200, 200)))
-        ctrl_hint = "  ←/→: mode   +/-: count" if build_fn else ""
-        lines.append((font_sm,
-                       "Enter/Space = proceed   Esc = abort   drag = orbit   scroll = zoom"
-                       + ctrl_hint,
-                      (160, 160, 160)))
-        lines.append((font_sm,   "", (0, 0, 0)))
+        cov_opts = ["Solid", "Overlay", "Plain"]
+        cov_str = "  ".join(
+            f"[{o}]" if i == cov_draw_mode else f" {o} "
+            for i, o in enumerate(cov_opts)
+        )
+
+        lines = [
+            (font_sm, f"Verts: {len(mesh.vertices):,}   Faces: {len(mesh.faces):,}"
+                      f"   Cams: {len(cameras)}   FPS {fps:3d}"
+                      + (f"   Mode: {mode_name}" if build_fn else ""),
+             DIM),
+            (font_sm, f"C  {cov_str}",
+             ON if cov_draw_mode != 0 else OFF),
+            (font_sm, "Enter/Space: proceed   Esc: abort   drag: orbit   scroll: zoom"
+                      + ("   </>/Tab: mode   +/-: count" if build_fn else ""),
+             DIM),
+            (font_sm, "", (0, 0, 0)),
+        ]
         for ci, pos in enumerate(cam_positions):
             col = _CAM_COLORS[ci % len(_CAM_COLORS)]
             lines.append((font_bold,
-                           f"  Cam {ci+1:2d}  ({pos[0]:+.2f}, {pos[1]:+.2f}, {pos[2]:+.2f})",
-                           r255(col)))
+                          f"  Cam {ci+1:2d}  ({pos[0]:+.2f}, {pos[1]:+.2f}, {pos[2]:+.2f})",
+                          r255(col)))
 
         sw = max(fnt.size(txt)[0] for fnt, txt, _ in lines) + PAD * 2
         sh = LH * len(lines) + PAD * 2
@@ -770,8 +1007,10 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
     hud_tid    = None
     hud_w = hud_h = 0
     proceed    = True
+    # 0 = solid coverage colours, 1 = transparent overlay over grey, 2 = plain grey
+    cov_draw_mode = 0
 
-    print(f"[camera-gui] {len(cameras)} cameras placed — Enter to proceed, Esc to abort")
+    print(f"[camera-gui] {len(cameras)} cameras placed — Enter to proceed, Esc to abort, C: cycle coverage")
 
     running = True
     while running:
@@ -794,6 +1033,9 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
                     hud_tid = None
                 elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS) and build_fn:
                     _rebuild(mode_idx, n_cams - 1)
+                    hud_tid = None
+                elif event.key == pygame.K_c:
+                    cov_draw_mode = (cov_draw_mode + 1) % 3
                     hud_tid = None
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
@@ -834,7 +1076,7 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
         glRotatef(pitch, 1, 0, 0)
         glRotatef(yaw,   0, 1, 0)
 
-        # ── Mesh (solid, coloured by best-covering camera) ─────────────────────
+        # ── Mesh ───────────────────────────────────────────────────────────────
         glEnable(GL_LIGHTING)
         glEnable(GL_COLOR_MATERIAL)
         glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
@@ -842,19 +1084,49 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
         glEnable(GL_POLYGON_OFFSET_FILL)
         glPolygonOffset(1.0, 1.0)
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
-        glBegin(GL_TRIANGLES)
-        for fi, face in enumerate(faces):
-            ci  = int(face_cam[fi])
-            col = _CAM_COLORS[ci % len(_CAM_COLORS)]
-            # Dim backfaces (score ≤ 0) so uncovered areas stay dark
-            if face_max[fi] > 0:
-                glColor3f(*col)
-            else:
-                glColor3f(0.25, 0.25, 0.28)
-            for vi in face:
-                glNormal3fv(normals[vi])
-                glVertex3fv(verts[vi])
-        glEnd()
+
+        def _draw_coverage_faces(alpha=1.0):
+            glBegin(GL_TRIANGLES)
+            for fi, face in enumerate(faces):
+                ci  = int(face_cam[fi])
+                col = _CAM_COLORS[ci % len(_CAM_COLORS)]
+                if face_max[fi] > 0:
+                    glColor4f(*col, alpha)
+                else:
+                    glColor4f(0.25, 0.25, 0.28, alpha)
+                for vi in face:
+                    glNormal3fv(normals[vi])
+                    glVertex3fv(verts[vi])
+            glEnd()
+
+        if cov_draw_mode == 2:
+            # Plain grey — no coverage colours
+            glColor4f(0.55, 0.55, 0.60, 1.0)
+            glBegin(GL_TRIANGLES)
+            for fi, face in enumerate(faces):
+                for vi in face:
+                    glNormal3fv(normals[vi])
+                    glVertex3fv(verts[vi])
+            glEnd()
+        elif cov_draw_mode == 1:
+            # Grey base + transparent coverage overlay
+            glColor4f(0.55, 0.55, 0.60, 1.0)
+            glBegin(GL_TRIANGLES)
+            for fi, face in enumerate(faces):
+                for vi in face:
+                    glNormal3fv(normals[vi])
+                    glVertex3fv(verts[vi])
+            glEnd()
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glPolygonOffset(-1.0, -1.0)
+            _draw_coverage_faces(alpha=0.5)
+            glPolygonOffset(1.0, 1.0)
+            glDisable(GL_BLEND)
+        else:
+            # Solid coverage colours (default)
+            _draw_coverage_faces(alpha=1.0)
+
         glDisable(GL_COLOR_MATERIAL)
         glDisable(GL_POLYGON_OFFSET_FILL)
 

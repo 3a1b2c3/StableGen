@@ -430,20 +430,30 @@ def _cameras_save_path(mesh_path):
     return base + ".cameras.json"
 
 
-def _save_cameras(cameras, path):
-    data = []
-    for c in cameras:
-        data.append({k: v.tolist() if hasattr(v, "tolist") else v
-                     for k, v in c.items()})
+def _save_cameras(cameras, path, mode=None, n=None):
+    payload = {
+        "mode": mode,
+        "n": n,
+        "cameras": [{k: v.tolist() if hasattr(v, "tolist") else v
+                     for k, v in c.items()} for c in cameras],
+    }
     with open(path, "w") as fh:
-        json.dump(data, fh)
+        json.dump(payload, fh)
 
 
 def _load_cameras(path):
     with open(path) as fh:
-        data = json.load(fh)
-    return [{k: np.array(v) if isinstance(v, list) else v
-             for k, v in entry.items()} for entry in data]
+        raw = json.load(fh)
+    # Support both old format (plain list) and new format (dict with metadata)
+    if isinstance(raw, list):
+        cam_list, mode, n = raw, None, None
+    else:
+        cam_list = raw.get("cameras", [])
+        mode = raw.get("mode")
+        n    = raw.get("n")
+    cameras = [{k: np.array(v) if isinstance(v, list) else v
+                for k, v in entry.items()} for entry in cam_list]
+    return cameras, mode, n
 
 
 # ── Depth rendering with pyrender ─────────────────────────────────────────────
@@ -1007,7 +1017,7 @@ def build_uv_3d_map(mesh, uv, tex_size):
         normal_map (tex_size, tex_size, 3) float32  — face normal
         valid_mask (tex_size, tex_size)    bool
     """
-    print(f"[standalone] Building UV→3D map ({tex_size}×{tex_size}) ...")
+    print(f"[standalone] Building UV->3D map ({tex_size}x{tex_size}) ...")
     uv_arr = np.array(uv, dtype=float)
     print(f"[standalone] UV range: U [{uv_arr[:,0].min():.4f}, {uv_arr[:,0].max():.4f}]  "
           f"V [{uv_arr[:,1].min():.4f}, {uv_arr[:,1].max():.4f}]")
@@ -1152,7 +1162,7 @@ def bake_texture(pos_map, normal_map, valid_mask, cameras, gen_images, tex_size)
     mask = wts > 0
     tex[mask] /= wts[mask, np.newaxis]
     tex = np.clip(tex, 0, 255).astype(np.uint8)
-    print(f"[standalone] Bake complete — {mask.sum():,} texels filled")
+    print(f"[standalone] Bake complete: {mask.sum():,} texels filled")
     return Image.fromarray(tex, "RGB")
 
 
@@ -1209,6 +1219,39 @@ def bake_coverage_texture(pos_map, normal_map, valid_mask, cameras, tex_size):
 
 # ── Mesh export ───────────────────────────────────────────────────────────────
 
+def _save_uv_overlay(texture_img, uv, mesh_faces, output_dir):
+    """Draw UV island boundaries over a copy of the texture and save as texture_uv.png.
+    Only island boundary edges (seam edges) are drawn — not all triangle edges."""
+    from PIL import ImageDraw
+    from collections import Counter
+    w, h = texture_img.size
+    overlay = texture_img.copy().convert("RGBA")
+    draw = ImageDraw.Draw(overlay)
+    uv_px = np.array(uv, dtype=np.float32)
+    uv_px[:, 0] = uv_px[:, 0] * w
+    uv_px[:, 1] = (1.0 - uv_px[:, 1]) * h  # flip V
+
+    # Count how many triangles each edge belongs to.
+    # Boundary edges (count==1) are island seams; interior edges (count==2) are skipped.
+    edge_count = Counter()
+    for tri in mesh_faces:
+        for i in range(3):
+            a, b = int(tri[i]), int(tri[(i + 1) % 3])
+            edge_count[tuple(sorted((a, b)))] += 1
+
+    for tri in mesh_faces:
+        for i in range(3):
+            a, b = int(tri[i]), int(tri[(i + 1) % 3])
+            if edge_count[tuple(sorted((a, b)))] == 1:
+                draw.line([tuple(uv_px[a]), tuple(uv_px[b])],
+                          fill=(255, 220, 0, 220), width=2)
+
+    out = overlay.convert("RGB")
+    uv_path = os.path.join(output_dir, "texture_uv.png")
+    out.save(uv_path)
+    print(f"[standalone] UV overlay saved: {os.path.abspath(uv_path)}")
+
+
 def export_textured_mesh(mesh, uv, texture_img, output_dir, fmt):
     if fmt == "none":
         return
@@ -1217,6 +1260,8 @@ def export_textured_mesh(mesh, uv, texture_img, output_dir, fmt):
     tex_path = os.path.join(output_dir, "texture.png")
     texture_img.save(tex_path)
     print(f"[standalone] Texture saved: {os.path.abspath(tex_path)}")
+
+    _save_uv_overlay(texture_img, uv, mesh.faces, output_dir)
 
     # Attach UV + texture to mesh copy
     material = trimesh.visual.texture.SimpleMaterial(image=texture_img)
@@ -1255,8 +1300,8 @@ def _parse_args():
     p.add_argument("--prompt",              metavar="TEXT",    default="")
     p.add_argument("--negative",            metavar="TEXT",    default="")
     p.add_argument("--checkpoint",          metavar="FILE",    default="RealVisXL_V5.0_fp16.safetensors")
-    p.add_argument("--cameras",             type=int,          default=6)
-    p.add_argument("--camera-mode",         type=int,          default=5,
+    p.add_argument("--cameras",             type=int,          default=None)
+    p.add_argument("--camera-mode",         type=int,          default=None,
                    choices=range(1, 8), metavar="1-7")
     p.add_argument("--steps",               type=int,          default=20)
     p.add_argument("--cfg",                 type=float,        default=7.0)
@@ -1277,6 +1322,9 @@ def _parse_args():
                    help="Force spherical UV instead of mesh UVs or xatlas")
     p.add_argument("--upscale-result",      action="store_true",
                    help="Upscale the baked texture with an upscale model after generation")
+    p.add_argument("--upscale-texture",     metavar="FILE",
+                   help="Upscale an existing texture FILE via ComfyUI and re-export the mesh; "
+                        "skips all generation steps (requires --mesh)")
     p.add_argument("--upscale-model",       metavar="MODEL",
                    default="4x-UltraSharp.pth",
                    help="Upscale model in ComfyUI models/upscale_models/ "
@@ -1328,19 +1376,23 @@ def main():
         result = download_upscaler(args.download_upscaler, dest)
         sys.exit(0 if result else 1)
 
-    # Track which auto-able args were explicitly provided vs left at default.
-    _AUTO_KEYS = ("cameras", "camera_mode", "tex_size", "controlnet_strength")
-    _explicit = {k: getattr(args, k) for k in _AUTO_KEYS
-                 if getattr(args, k) != {
-                     "cameras": 6, "camera_mode": 5,
-                     "tex_size": 1024, "controlnet_strength": 0.6,
-                 }[k]}
+    # Track which args were explicitly provided on the command line (not left as None/default).
+    # --cameras and --camera-mode default to None so None == "not specified".
+    _DEFAULTS = {"cameras": 6, "camera_mode": 5, "tex_size": 1024, "controlnet_strength": 0.6}
+    _AUTO_KEYS = tuple(_DEFAULTS.keys())
+    _explicit = {k for k in _AUTO_KEYS if getattr(args, k) is not None}
+    # Apply hard defaults for args not on the command line (used outside the GUI path).
+    for k, v in _DEFAULTS.items():
+        if getattr(args, k) is None:
+            setattr(args, k, v)
 
     # 1. Check ComfyUI — exits with code 1 and a clear message on failure.
     #    --suggest skips this (no server needed to analyse a mesh).
+    #    --upscale-texture skips checkpoint validation (no SDXL checkpoint needed).
     if not args.suggest:
         check_server(args.server)
-        validate_checkpoint(args.server, args.checkpoint)
+        if not args.upscale_texture:
+            validate_checkpoint(args.server, args.checkpoint)
     if args.check:
         sys.exit(0)
 
@@ -1383,7 +1435,7 @@ def main():
     if args.suggest:
         s = estimate_settings(mesh)
         r = s["reasons"]
-        print("\n[suggest] ── Recommended settings ──────────────────────────")
+        print("\n[suggest] -- Recommended settings --")
         print(f"[suggest]  --cameras             {s['cameras']:>4}   # {r['cameras']}")
         print(f"[suggest]  --camera-mode         {s['camera_mode']:>4}   # {r['camera_mode']}")
         print(f"[suggest]  --tex-size            {s['tex_size']:>4}   # {r['tex_size']}")
@@ -1409,12 +1461,13 @@ def main():
                 setattr(args, key, s[key])
                 print(f"[auto] {key}={s[key]}  ({s['reasons'].get(key, '')})")
 
-    print(f"[standalone] ── StableGen standalone ──")
+    print(f"[standalone] -- StableGen standalone --")
     print(f"[standalone] Mesh      : {args.mesh}")
     print(f"[standalone] Prompt    : {args.prompt!r}")
     print(f"[standalone] Checkpoint: {args.checkpoint}")
     print(f"[standalone] Server    : {args.server}")
-    print(f"[standalone] Cameras   : {args.cameras} (mode {args.camera_mode})")
+    print(f"[standalone] Cameras   : {args.cameras} (mode {args.camera_mode})"
+          + ("  [camera-gui]" if args.camera_gui else ""))
     print(f"[standalone] pyrender  : {'yes' if _PYRENDER else 'no (pip install pyrender)'}")
     print(f"[standalone] xatlas    : {'yes' if _XATLAS else 'no (pip install xatlas)'}")
 
@@ -1423,41 +1476,70 @@ def main():
     # 3. UV
     mesh, uv = ensure_uv(mesh, force_spherical=args.spherical_uv)
 
+    # 3b. --upscale-texture: skip generation, upscale an existing texture and re-export
+    if args.upscale_texture:
+        if not os.path.isfile(args.upscale_texture):
+            print(f"[standalone] ERROR: texture not found: {args.upscale_texture}",
+                  file=sys.stderr)
+            sys.exit(1)
+        texture = Image.open(args.upscale_texture).convert("RGB")
+        print(f"[standalone] Upscaling {args.upscale_texture} "
+              f"({texture.size[0]}x{texture.size[1]}) with {args.upscale_model} ...")
+        texture = upscale_texture(args.server, texture, args.upscale_model,
+                                  save_dir=args.output)
+        export_textured_mesh(mesh, uv, texture, args.output, args.export)
+        print(f"\n[standalone] Done.  Output: {os.path.abspath(args.output)}")
+        if args.view:
+            view_result(mesh, uv, texture)
+        sys.exit(0)
+
     # 4. Place cameras
     cameras = build_cameras(mesh, args.cameras, args.camera_mode,
                             args.width, args.height)
     print(f"[standalone] Placed {len(cameras)} cameras")
 
-    # 4b. Optional camera placement GUI
+    # 4b. Optional camera placement GUI — always shown when --camera-gui is set
     if args.camera_gui:
         _cam_save = _cameras_save_path(args.mesh)
-        if os.path.exists(_cam_save):
-            cameras = _load_cameras(_cam_save)
-            print(f"[camera-gui] Loaded {len(cameras)} saved cameras from "
-                  f"{_cam_save}  (delete file to re-run GUI)")
-        else:
-            # Use mesh heuristics for the GUI starting values unless the user
-            # explicitly set those args on the command line.
-            _gui_suggested = estimate_settings(mesh)
-            _gui_init_n    = args.cameras    if "cameras"     in _explicit else _gui_suggested["cameras"]
-            _gui_init_mode = args.camera_mode if "camera_mode" in _explicit else _gui_suggested["camera_mode"]
-            if _gui_init_n != args.cameras or _gui_init_mode != args.camera_mode:
-                print(f"[camera-gui] heuristic start: {_gui_init_n} cams, "
-                      f"mode {_gui_init_mode} ({_gui_suggested['reasons']['cameras']}; "
-                      f"{_gui_suggested['reasons']['camera_mode']})")
-            _build_fn = lambda n, mode: build_cameras(
-                mesh, n, mode, args.width, args.height)
-            proceed, cameras = view_cameras(
-                mesh, cameras,
-                build_fn=_build_fn,
-                init_mode=_gui_init_mode,
-                init_n=_gui_init_n,
-            )
-            if not proceed:
-                print("[standalone] Aborted by user in camera GUI.")
-                sys.exit(0)
-            _save_cameras(cameras, _cam_save)
-            print(f"[camera-gui] Camera selection saved to {_cam_save}")
+
+        # Determine init mode/count: saved > explicit CLI > heuristic
+        _saved_cameras, _saved_mode, _saved_n = (
+            _load_cameras(_cam_save) if os.path.exists(_cam_save)
+            else (cameras, None, None)
+        )
+        if _saved_mode is not None or _saved_n is not None:
+            print(f"[camera-gui] Restoring saved settings: "
+                  f"{_saved_n} cams, mode {_saved_mode}")
+
+        _need_heuristic = (
+            ("cameras"     not in _explicit and _saved_n    is None) or
+            ("camera_mode" not in _explicit and _saved_mode is None)
+        )
+        _gui_suggested = estimate_settings(mesh) if _need_heuristic else {}
+
+        _gui_init_n = (
+            args.cameras          if "cameras"      in _explicit else
+            _saved_n              if _saved_n        is not None  else
+            _gui_suggested["cameras"]
+        )
+        _gui_init_mode = (
+            args.camera_mode      if "camera_mode"  in _explicit else
+            _saved_mode           if _saved_mode     is not None  else
+            _gui_suggested["camera_mode"]
+        )
+
+        _build_fn = lambda n, mode: build_cameras(mesh, n, mode, args.width, args.height)
+        proceed, cameras = view_cameras(
+            mesh, _saved_cameras,
+            build_fn=_build_fn,
+            init_mode=_gui_init_mode,
+            init_n=_gui_init_n,
+        )
+        if not proceed:
+            print("[standalone] Aborted by user in camera GUI.")
+            sys.exit(0)
+        _save_cameras(cameras, _cam_save, mode=_gui_init_mode, n=len(cameras))
+        print(f"[camera-gui] Camera selection saved to {_cam_save}")
 
     # 5. Generate one image per camera
     gen_images = []
@@ -1469,7 +1551,7 @@ def main():
         view_warnings.append("xatlas not installed — spherical UV used")
 
     for ci, cam in enumerate(cameras):
-        print(f"\n[standalone] ── Camera {ci+1}/{len(cameras)} ──")
+        print(f"\n[standalone] -- Camera {ci+1}/{len(cameras)} --")
 
         # Render depth (optional)
         depth_img = None
