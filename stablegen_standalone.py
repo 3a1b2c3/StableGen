@@ -562,8 +562,7 @@ def render_depth_view(mesh, cam, width, height):
         renderer = pyrender.OffscreenRenderer(width, height)
         _, depth = renderer.render(scene)
         renderer.delete()
-    except Exception as e:
-        print(f"[standalone] pyrender error: {e}", file=sys.stderr)
+    except Exception:
         return None
 
     depth[depth == 0] = np.nan
@@ -1407,7 +1406,7 @@ def _save_uv_overlay(texture_img, uv, mesh_faces, output_dir):
                           fill=(255, 220, 0, 220), width=2)
 
     out = overlay.convert("RGB")
-    uv_path = os.path.join(output_dir, "texture_uv.png")
+    uv_path = os.path.join(output_dir, "debug_texture_uv.png")
     out.save(uv_path)
     print(f"[standalone] UV overlay saved: {os.path.abspath(uv_path)}")
 
@@ -1756,7 +1755,7 @@ def main():
                 depth_img = depth_to_image(depth)
                 print(f"[debug_standalone] Depth rendered")
             else:
-                print("[standalone] Depth rendering failed, skipping ControlNet")
+                pass
 
         img = generate_view(args.server, args, ci, depth_img=depth_img,
                             save_dir=args.output)
@@ -1764,6 +1763,7 @@ def main():
             print(f"[standalone] ERROR: camera {ci+1} generation failed", file=sys.stderr)
             sys.exit(1)
         print(f"[debug_standalone] Image: {img.size}")
+        img.show()
         gen_images.append(img)
 
     # 6. Build UV map and bake
