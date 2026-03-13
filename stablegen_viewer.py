@@ -620,7 +620,7 @@ _CAM_MODES = [
 ]
 
 
-def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
+def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None, texture_img=None, uv=None):
     """
     Show the mesh + placed cameras in a pygame/OpenGL window.
     Each camera is drawn with its position, a line to the mesh centroid,
@@ -643,7 +643,7 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
             GL_AMBIENT, GL_AMBIENT_AND_DIFFUSE, GL_BLEND,
             GL_COLOR_BUFFER_BIT, GL_COLOR_MATERIAL, GL_DEPTH_BUFFER_BIT,
             GL_DEPTH_TEST, GL_DIFFUSE, GL_FILL, GL_FRONT_AND_BACK, GL_LIGHT0,
-            GL_LIGHTING, GL_LINES, GL_LINEAR, GL_MODELVIEW, GL_NORMALIZE,
+            GL_LIGHTING, GL_LINE_LOOP, GL_LINES, GL_LINEAR, GL_MODELVIEW, GL_NORMALIZE,
             GL_ONE_MINUS_SRC_ALPHA, GL_POINTS, GL_POLYGON_OFFSET_FILL,
             GL_POSITION, GL_PROJECTION, GL_QUADS, GL_RGBA, GL_SRC_ALPHA,
             GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER,
@@ -677,6 +677,26 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
         verts /= scale
 
     face_normals_raw = np.array(mesh.face_normals, dtype=np.float32)
+
+    mesh_uv = None
+    _cam_uv_seam_pairs = []   # 2D UV-space seam pairs for inset
+    _cam_seam_edges_3d = []   # 3D vertex pairs for on-mesh overlay
+    try:
+        uv_raw = uv if uv is not None else mesh.visual.uv
+        if uv_raw is not None and len(uv_raw) == len(mesh.vertices):
+            mesh_uv = np.array(uv_raw, dtype=np.float32)
+            _edge_cnt = {}
+            for tri in faces:
+                for i in range(3):
+                    a, b = int(tri[i]), int(tri[(i+1) % 3])
+                    key = (min(a, b), max(a, b))
+                    _edge_cnt[key] = _edge_cnt.get(key, 0) + 1
+            for (a, b), cnt in _edge_cnt.items():
+                if cnt == 1:
+                    _cam_uv_seam_pairs.append((mesh_uv[a], mesh_uv[b]))
+                    _cam_seam_edges_3d.append((verts[a], verts[b]))
+    except Exception:
+        pass
 
     cam_positions = []
     cam_frustums  = []
@@ -742,7 +762,7 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
         try:
             cameras = build_fn(n_cams, mode_int)
         except Exception as e:
-            print(f"[camera-gui] build_fn error: {e}", file=sys.stderr)
+            print(f"[debug_camera-gui] build_fn error: {e}", file=sys.stderr)
             return
         # Recompute positions and frustums
         cam_positions.clear()
@@ -790,6 +810,22 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
     glLightfv(GL_LIGHT0, GL_AMBIENT,  np.array([0.30, 0.30, 0.30, 1.0], dtype=np.float32))
     glMaterialfv(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE, np.array([0.55, 0.55, 0.60, 1.0], dtype=np.float32))
     glClearColor(0.10, 0.10, 0.10, 1.0)
+
+    mesh_tex_id = None
+    if texture_img is not None and mesh_uv is not None:
+        try:
+            mesh_tex_id = _gen_tex()
+            tex_data = np.flipud(np.array(texture_img.convert("RGBA"), dtype=np.uint8))
+            glBindTexture(GL_TEXTURE_2D, mesh_tex_id)
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+                         tex_data.shape[1], tex_data.shape[0],
+                         0, GL_RGBA, GL_UNSIGNED_BYTE, tex_data.tobytes())
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        except Exception as e:
+            print(f"[debug_camera-gui] texture upload failed: {e}", file=sys.stderr)
+            mesh_tex_id = None
 
     # ── HUD helpers ───────────────────────────────────────────────────────────
     font_sm   = pygame.font.SysFont("consolas", 14)
@@ -944,11 +980,13 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
         r255 = lambda rgb: tuple(int(c * 255) for c in rgb)
 
         mode_name = _CAM_MODES[mode_idx][1] if build_fn else ""
-        cov_opts = ["Solid", "Overlay", "Plain"]
+        cov_opts = ["Solid", "Overlay", "Plain"] + (["Textured"] if mesh_tex_id is not None else [])
         cov_str = "  ".join(
             f"[{o}]" if i == cov_draw_mode else f" {o} "
             for i, o in enumerate(cov_opts)
         )
+
+        uv_str = f"UV Seams: {'ON ' if show_uvs else 'off'}"
 
         lines = [
             (font_sm, f"Verts: {len(mesh.vertices):,}   Faces: {len(mesh.faces):,}"
@@ -957,6 +995,8 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
              DIM),
             (font_sm, f"C  {cov_str}",
              ON if cov_draw_mode != 0 else OFF),
+            (font_sm, f"U  {uv_str}",
+             ON if show_uvs else OFF),
             (font_sm, "Enter/Space: proceed   Esc: abort   drag: orbit   scroll: zoom"
                       + ("   </>/Tab: mode   +/-: count" if build_fn else ""),
              DIM),
@@ -1009,8 +1049,9 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
     proceed    = True
     # 0 = solid coverage colours, 1 = transparent overlay over grey, 2 = plain grey
     cov_draw_mode = 0
+    show_uvs = False
 
-    print(f"[camera-gui] {len(cameras)} cameras placed — Enter to proceed, Esc to abort, C: cycle coverage")
+    print(f"[debug_camera-gui] {len(cameras)} cameras placed — Enter to proceed, Esc to abort, C: cycle coverage, U: UV seams")
 
     running = True
     while running:
@@ -1035,7 +1076,11 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
                     _rebuild(mode_idx, n_cams - 1)
                     hud_tid = None
                 elif event.key == pygame.K_c:
-                    cov_draw_mode = (cov_draw_mode + 1) % 3
+                    _n_cov = 4 if mesh_tex_id is not None else 3
+                    cov_draw_mode = (cov_draw_mode + 1) % _n_cov
+                    hud_tid = None
+                elif event.key == pygame.K_u:
+                    show_uvs = not show_uvs
                     hud_tid = None
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
@@ -1123,6 +1168,20 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
             _draw_coverage_faces(alpha=0.5)
             glPolygonOffset(1.0, 1.0)
             glDisable(GL_BLEND)
+        elif cov_draw_mode == 3 and mesh_tex_id is not None and mesh_uv is not None:
+            # Textured
+            glDisable(GL_COLOR_MATERIAL)
+            glEnable(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, mesh_tex_id)
+            glColor4f(1.0, 1.0, 1.0, 1.0)
+            glBegin(GL_TRIANGLES)
+            for fi, face in enumerate(faces):
+                for vi in face:
+                    glTexCoord2f(mesh_uv[vi, 0], 1.0 - mesh_uv[vi, 1])
+                    glNormal3fv(normals[vi])
+                    glVertex3fv(verts[vi])
+            glEnd()
+            glDisable(GL_TEXTURE_2D)
         else:
             # Solid coverage colours (default)
             _draw_coverage_faces(alpha=1.0)
@@ -1166,6 +1225,62 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
         glPointSize(1.0)
         glLineWidth(1.0)
 
+        # ── UV seam edges on mesh ──────────────────────────────────────────────
+        if show_uvs and _cam_seam_edges_3d:
+            glDisable(GL_DEPTH_TEST)
+            glColor3f(1.0, 0.85, 0.1)
+            glLineWidth(1.5)
+            glBegin(GL_LINES)
+            for va, vb in _cam_seam_edges_3d:
+                glVertex3f(*va); glVertex3f(*vb)
+            glEnd()
+            glLineWidth(1.0)
+            glEnable(GL_DEPTH_TEST)
+
+        # ── UV seam inset ─────────────────────────────────────────────────────
+        if show_uvs and _cam_uv_seam_pairs:
+            INSET  = 220
+            MARGIN = 8
+            PAD    = 10
+            ix0 = W - INSET - PAD
+            iy0 = PAD
+
+            glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING); glDisable(GL_TEXTURE_2D)
+            glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+            glOrtho(0, W, H, 0, -1, 1)
+            glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity()
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+            glColor4f(0.05, 0.05, 0.05, 0.85)
+            glBegin(GL_QUADS)
+            glVertex2f(ix0,       iy0);        glVertex2f(ix0+INSET, iy0)
+            glVertex2f(ix0+INSET, iy0+INSET);  glVertex2f(ix0,       iy0+INSET)
+            glEnd()
+
+            glColor4f(0.5, 0.5, 0.5, 0.8)
+            glLineWidth(1.0)
+            glBegin(GL_LINE_LOOP)
+            glVertex2f(ix0,       iy0);        glVertex2f(ix0+INSET, iy0)
+            glVertex2f(ix0+INSET, iy0+INSET);  glVertex2f(ix0,       iy0+INSET)
+            glEnd()
+
+            inner = INSET - MARGIN * 2
+            glColor4f(1.0, 0.85, 0.1, 0.9)
+            glLineWidth(1.5)
+            glBegin(GL_LINES)
+            for uva, uvb in _cam_uv_seam_pairs:
+                glVertex2f(ix0 + MARGIN + float(uva[0]) * inner,
+                           iy0 + MARGIN + (1.0 - float(uva[1])) * inner)
+                glVertex2f(ix0 + MARGIN + float(uvb[0]) * inner,
+                           iy0 + MARGIN + (1.0 - float(uvb[1])) * inner)
+            glEnd()
+            glLineWidth(1.0)
+
+            glDisable(GL_BLEND)
+            glMatrixMode(GL_PROJECTION); glPopMatrix()
+            glMatrixMode(GL_MODELVIEW);  glPopMatrix()
+            glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING)
+
         # ── HUD ───────────────────────────────────────────────────────────────
         new_fps = int(clock.get_fps())
         if hud_tid is None or new_fps != fps:
@@ -1184,5 +1299,7 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None):
         glDeleteTextures([hud_tid])
     for tid, _, _ in tab_tex_ids.values():
         glDeleteTextures([tid])
+    if mesh_tex_id is not None:
+        glDeleteTextures([mesh_tex_id])
     pygame.quit()
     return proceed, cameras

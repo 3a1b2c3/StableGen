@@ -198,10 +198,10 @@ def _load_usd_mesh(path):
                     img_data = zf.read(img_entries[0][1])
                     import io
                     tex_img = Image.open(io.BytesIO(img_data)).convert("RGB")
-                    print(f"[usd] Loaded texture: {img_entries[0][1]} "
+                    print(f"[debug_usd] Loaded texture: {img_entries[0][1]} "
                           f"({tex_img.size[0]}x{tex_img.size[1]})")
         except Exception as e:
-            print(f"[usd] Could not extract texture from USDZ: {e}")
+            print(f"[debug_usd] Could not extract texture from USDZ: {e}")
 
     if tex_img is not None and merged_uv is not None:
         mat = trimesh.visual.texture.SimpleMaterial(image=tex_img)
@@ -730,7 +730,7 @@ def _run_workflow(server, prompt_dict):
                         if current_node:
                             print()   # finish previous node line
                         current_node = d["node"]
-                        print(f"[standalone]   node {current_node} ...", flush=True)
+                        print(f"[debug_standalone]   node {current_node} ...", flush=True)
             elif msg["type"] == "progress":
                 v, m = msg["data"]["value"], msg["data"]["max"]
                 bar_w = 30
@@ -964,7 +964,7 @@ def generate_view(server, args, cam_idx, depth_img=None, save_dir=None):
             info = _upload_image(server, tmp_depth)
             depth_name = info.get("name") if info else None
         except Exception as e:
-            print(f"[standalone] depth upload failed: {e}", file=sys.stderr)
+            print(f"[debug_standalone] depth upload failed: {e}", file=sys.stderr)
             depth_name = None
 
     if depth_name:
@@ -983,7 +983,7 @@ def generate_view(server, args, cam_idx, depth_img=None, save_dir=None):
     try:
         images = _run_workflow(server, wf)
     except Exception as e:
-        print(f"[standalone] generation failed: {e}", file=sys.stderr)
+        print(f"[debug_standalone] generation failed: {e}", file=sys.stderr)
         traceback.print_exc()
         return None
 
@@ -999,7 +999,7 @@ def generate_view(server, args, cam_idx, depth_img=None, save_dir=None):
     if raw is None and images:
         raw = next(iter(images.values()))[0]
     if raw is None:
-        print(f"[standalone] no image received for view {cam_idx}", file=sys.stderr)
+        print(f"[debug_standalone] no image received for view {cam_idx}", file=sys.stderr)
         return None
 
     img = Image.open(BytesIO(raw)).convert("RGB")
@@ -1007,7 +1007,7 @@ def generate_view(server, args, cam_idx, depth_img=None, save_dir=None):
     if save_dir and args.save_views:
         p = os.path.abspath(os.path.join(save_dir, f"view_{cam_idx:02d}.png"))
         img.save(p)
-        print(f"[standalone] Saved: {p}")
+        print(f"[debug_standalone] Saved: {p}")
 
     return img
 
@@ -1069,7 +1069,7 @@ def _find_mesh_texture(mesh_path):
                     cand = os.path.join(mesh_dir, tok[-1].replace("\\", os.sep))
                     img = _load_img(cand)
                     if img:
-                        print(f"[texture] Found via MTL: {cand}")
+                        print(f"[debug_texture] Found via MTL: {cand}")
                         return img
 
     # 2 & 3. Scan directory for image files
@@ -1087,7 +1087,7 @@ def _find_mesh_texture(mesh_path):
     for fn in candidates:
         img = _load_img(os.path.join(mesh_dir, fn))
         if img:
-            print(f"[texture] Found in mesh folder: {fn}")
+            print(f"[debug_texture] Found in mesh folder: {fn}")
             return img
     return None
 
@@ -1130,17 +1130,17 @@ def ensure_uv(mesh, force_spherical=False, force_xatlas=False):
     if not force_spherical and not force_xatlas:
         uv = _get_uv(mesh)
         if uv is not None:
-            print(f"[standalone] Using existing UV coords ({len(uv)} verts)")
+            print(f"[debug_standalone] Using existing UV coords ({len(uv)} verts)")
             return mesh, uv
 
     if _XATLAS and not force_spherical:
         try:
-            print("[standalone] Generating UV with xatlas ...")
+            print("[debug_standalone] Generating UV with xatlas ...")
             mesh_new, uv = _xatlas_uv(mesh)
-            print(f"[standalone] xatlas UV: {len(uv)} verts, {len(mesh_new.faces)} faces")
+            print(f"[debug_standalone] xatlas UV: {len(uv)} verts, {len(mesh_new.faces)} faces")
             return mesh_new, uv
         except Exception as e:
-            print(f"[standalone] xatlas failed: {e}, falling back to spherical", file=sys.stderr)
+            print(f"[debug_standalone] xatlas failed: {e}, falling back to spherical", file=sys.stderr)
 
     print("[standalone] Using spherical UV mapping (install xatlas for better results)")
     uv = _spherical_uv(mesh)
@@ -1177,9 +1177,9 @@ def build_uv_3d_map(mesh, uv, tex_size):
         normal_map (tex_size, tex_size, 3) float32  — face normal
         valid_mask (tex_size, tex_size)    bool
     """
-    print(f"[standalone] Building UV->3D map ({tex_size}x{tex_size}) ...")
+    print(f"[debug_standalone] Building UV->3D map ({tex_size}x{tex_size}) ...")
     uv_arr = np.array(uv, dtype=float)
-    print(f"[standalone] UV range: U [{uv_arr[:,0].min():.4f}, {uv_arr[:,0].max():.4f}]  "
+    print(f"[debug_standalone] UV range: U [{uv_arr[:,0].min():.4f}, {uv_arr[:,0].max():.4f}]  "
           f"V [{uv_arr[:,1].min():.4f}, {uv_arr[:,1].max():.4f}]")
     verts = np.array(mesh.vertices, dtype=float)
     faces = np.array(mesh.faces)
@@ -1235,7 +1235,7 @@ def build_uv_3d_map(mesh, uv, tex_size):
 
     valid_mask = ~np.isnan(pos_map[:, :, 0])
     n_valid = valid_mask.sum()
-    print(f"[standalone] UV map: {n_valid:,} texels covered "
+    print(f"[debug_standalone] UV map: {n_valid:,} texels covered "
           f"({100 * n_valid / tex_size**2:.1f}%)")
     return pos_map, normal_map, valid_mask
 
@@ -1253,7 +1253,7 @@ def bake_texture(pos_map, normal_map, valid_mask, cameras, gen_images, tex_size)
 
     Returns PIL.Image (RGB).
     """
-    print("[standalone] Baking texture ...")
+    print("[debug_standalone] Baking texture ...")
     tex   = np.zeros((tex_size, tex_size, 3), np.float32)
     wts   = np.zeros((tex_size, tex_size),    np.float32)
 
@@ -1316,13 +1316,13 @@ def bake_texture(pos_map, normal_map, valid_mask, cameras, gen_images, tex_size)
                   w_ang[idx_valid])
 
         n_painted = int(valid.sum())
-        print(f"[standalone] Camera {ci+1}/{len(cameras)}: painted {n_painted:,} texels")
+        print(f"[debug_standalone] Camera {ci+1}/{len(cameras)}: painted {n_painted:,} texels")
 
     # Normalise
     mask = wts > 0
     tex[mask] /= wts[mask, np.newaxis]
     tex = np.clip(tex, 0, 255).astype(np.uint8)
-    print(f"[standalone] Bake complete: {mask.sum():,} texels filled")
+    print(f"[debug_standalone] Bake complete: {mask.sum():,} texels filled")
     return Image.fromarray(tex, "RGB")
 
 
@@ -1657,55 +1657,6 @@ def main():
     # 3. UV
     mesh, uv = ensure_uv(mesh, force_spherical=args.spherical_uv)
 
-    # 4. Place cameras
-    cameras = build_cameras(mesh, args.cameras, args.camera_mode,
-                            args.width, args.height)
-    print(f"[standalone] Placed {len(cameras)} cameras")
-
-    # 4b. Optional camera placement GUI — always shown when --camera-gui is set
-    if args.camera_gui:
-        _cam_save = _cameras_save_path(args.mesh)
-
-        # Determine init mode/count: saved > explicit CLI > heuristic
-        _saved_cameras, _saved_mode, _saved_n = (
-            _load_cameras(_cam_save) if os.path.exists(_cam_save)
-            else (cameras, None, None)
-        )
-        if _saved_mode is not None or _saved_n is not None:
-            print(f"[camera-gui] Restoring saved settings: "
-                  f"{_saved_n} cams, mode {_saved_mode}")
-
-        _need_heuristic = (
-            ("cameras"     not in _explicit and _saved_n    is None) or
-            ("camera_mode" not in _explicit and _saved_mode is None)
-        )
-        _gui_suggested = estimate_settings(mesh) if _need_heuristic else {}
-
-        _gui_init_n = (
-            args.cameras          if "cameras"      in _explicit else
-            _saved_n              if _saved_n        is not None  else
-            _gui_suggested["cameras"]
-        )
-        _gui_init_mode = (
-            args.camera_mode      if "camera_mode"  in _explicit else
-            _saved_mode           if _saved_mode     is not None  else
-            _gui_suggested["camera_mode"]
-        )
-
-        _build_fn = lambda n, mode: build_cameras(mesh, n, mode, args.width, args.height)
-        print(f"[camera-gui] Opening GUI with {len(_saved_cameras)} cameras ...")
-        proceed, cameras = view_cameras(
-            mesh, _saved_cameras,
-            build_fn=_build_fn,
-            init_mode=_gui_init_mode,
-            init_n=_gui_init_n,
-        )
-        if not proceed:
-            print("[standalone] Aborted by user in camera GUI.")
-            sys.exit(0)
-        _save_cameras(cameras, _cam_save, mode=_gui_init_mode, n=len(cameras))
-        print(f"[camera-gui] Camera selection saved to {_cam_save}")
-
     # 3b. --upscale-texture: skip generation, upscale an existing texture and re-export
     if args.upscale_texture:
         if args.upscale_texture == "auto":
@@ -1734,6 +1685,57 @@ def main():
             view_result(mesh, uv, texture)
         sys.exit(0)
 
+    # 4. Place cameras
+    cameras = build_cameras(mesh, args.cameras, args.camera_mode,
+                            args.width, args.height)
+    print(f"[standalone] Placed {len(cameras)} cameras")
+
+    # 4b. Optional camera placement GUI — always shown when --camera-gui is set
+    if args.camera_gui:
+        _cam_save = _cameras_save_path(args.mesh)
+
+        _saved_cameras, _saved_mode, _saved_n = (
+            _load_cameras(_cam_save) if os.path.exists(_cam_save)
+            else (cameras, None, None)
+        )
+        if _saved_mode is not None or _saved_n is not None:
+            print(f"[debug_camera-gui] Restoring saved settings: "
+                  f"{_saved_n} cams, mode {_saved_mode}")
+
+        _need_heuristic = (
+            ("cameras"     not in _explicit and _saved_n    is None) or
+            ("camera_mode" not in _explicit and _saved_mode is None)
+        )
+        _gui_suggested = estimate_settings(mesh) if _need_heuristic else {}
+
+        _gui_init_n = (
+            args.cameras          if "cameras"      in _explicit else
+            _saved_n              if _saved_n        is not None  else
+            _gui_suggested["cameras"]
+        )
+        _gui_init_mode = (
+            args.camera_mode      if "camera_mode"  in _explicit else
+            _saved_mode           if _saved_mode     is not None  else
+            _gui_suggested["camera_mode"]
+        )
+
+        _build_fn = lambda n, mode: build_cameras(mesh, n, mode, args.width, args.height)
+        _cam_gui_texture = _get_texture(mesh) or _find_mesh_texture(args.mesh)
+        print(f"[camera-gui] Opening GUI with {len(_saved_cameras)} cameras ...")
+        proceed, cameras = view_cameras(
+            mesh, _saved_cameras,
+            build_fn=_build_fn,
+            init_mode=_gui_init_mode,
+            init_n=_gui_init_n,
+            texture_img=_cam_gui_texture,
+            uv=uv,
+        )
+        if not proceed:
+            print("[standalone] Aborted by user in camera GUI.")
+            sys.exit(0)
+        _save_cameras(cameras, _cam_save, mode=_gui_init_mode, n=len(cameras))
+        print(f"[debug_camera-gui] Camera selection saved to {_cam_save}")
+
     # 5. Generate one image per camera
     gen_images = []
     view_warnings = []
@@ -1752,7 +1754,7 @@ def main():
             depth = render_depth_view(mesh, cam, args.width, args.height)
             if depth is not None:
                 depth_img = depth_to_image(depth)
-                print(f"[standalone] Depth rendered")
+                print(f"[debug_standalone] Depth rendered")
             else:
                 print("[standalone] Depth rendering failed, skipping ControlNet")
 
@@ -1761,7 +1763,7 @@ def main():
         if img is None:
             print(f"[standalone] ERROR: camera {ci+1} generation failed", file=sys.stderr)
             sys.exit(1)
-        print(f"[standalone] Image: {img.size}")
+        print(f"[debug_standalone] Image: {img.size}")
         gen_images.append(img)
 
     # 6. Build UV map and bake
@@ -1770,8 +1772,8 @@ def main():
                             cameras, gen_images, args.tex_size)
     coverage = bake_coverage_texture(pos_map, normal_map, valid_mask,
                                      cameras, args.tex_size)
-    coverage.save(os.path.join(args.output, "coverage.png"))
-    print("[standalone] Coverage texture saved: coverage.png")
+    coverage.save(os.path.join(args.output, "debug_coverage.png"))
+    print("[standalone] Coverage texture saved: debug_coverage.png")
 
     # 7. Optional texture upscale
     if args.upscale_result:
