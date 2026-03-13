@@ -79,6 +79,7 @@ def _load_usd_mesh(path):
 
     Traverses all UsdGeom.Mesh prims, triangulates faces, applies the world
     transform, and concatenates everything into a single trimesh.Trimesh.
+    For USDZ files the largest embedded texture is attached as TextureVisuals.
     Raises RuntimeError with install hint when pxr is not available.
     """
     try:
@@ -91,6 +92,7 @@ def _load_usd_mesh(path):
 
     stage = Usd.Stage.Open(str(path))
     parts = []
+    all_uv   = []   # per-part UV arrays (None if not found)
 
     for prim in stage.Traverse():
         if not prim.IsA(UsdGeom.Mesh):
@@ -104,16 +106,16 @@ def _load_usd_mesh(path):
             continue
 
         verts = np.array(pts, dtype=np.float64)
-        counts = np.array(counts, dtype=np.int32)
-        indices = np.array(indices, dtype=np.int32)
+        counts_arr = np.array(counts, dtype=np.int32)
+        indices_arr = np.array(indices, dtype=np.int32)
 
         # Fan-triangulate each face (handles tris, quads and n-gons)
         faces = []
         idx = 0
-        for n in counts:
-            v0 = indices[idx]
+        for n in counts_arr:
+            v0 = indices_arr[idx]
             for k in range(1, n - 1):
-                faces.append([v0, indices[idx + k], indices[idx + k + 1]])
+                faces.append([v0, indices_arr[idx + k], indices_arr[idx + k + 1]])
             idx += n
         if not faces:
             continue
@@ -126,12 +128,90 @@ def _load_usd_mesh(path):
         verts_h = np.hstack([verts, np.ones((len(verts), 1))])
         verts = (verts_h @ m.T)[:, :3]
 
+        # ── UV primvars ────────────────────────────────────────────────────────
+        uv_part = None
+        try:
+            from pxr import UsdGeom as _UsdGeom  # already imported above
+            pvapi = _UsdGeom.PrimvarsAPI(prim)
+            for uvname in ("st", "st0", "UVMap", "texcoord0", "map1"):
+                pv = pvapi.GetPrimvar(uvname)
+                if not pv or not pv.IsDefined():
+                    continue
+                raw_vals = pv.Get()
+                if raw_vals is None:
+                    continue
+                raw_uv = np.array(raw_vals, dtype=np.float32)
+                interp  = pv.GetInterpolation()
+                if interp == "vertex" and len(raw_uv) == len(verts):
+                    uv_part = raw_uv
+                elif interp == "faceVarying" and len(raw_uv) == len(indices_arr):
+                    # Rebuild split vertices so UV is per-vertex
+                    new_verts, new_faces, new_uv = [], [], []
+                    vi = 0
+                    fi_out = 0
+                    raw_idx = 0
+                    for fc in counts_arr:
+                        v0_new = len(new_verts)
+                        for j in range(fc):
+                            new_verts.append(verts[indices_arr[vi + j]])
+                            new_uv.append(raw_uv[raw_idx + j])
+                        for k in range(1, fc - 1):
+                            new_faces.append([v0_new, v0_new + k, v0_new + k + 1])
+                        vi += fc
+                        raw_idx += fc
+                    verts = np.array(new_verts, dtype=np.float64)
+                    faces = np.array(new_faces, dtype=np.int32)
+                    uv_part = np.array(new_uv, dtype=np.float32)
+                break
+        except Exception:
+            pass
+
+        all_uv.append(uv_part)
         parts.append(trimesh.Trimesh(vertices=verts, faces=faces, process=False))
 
     if not parts:
         raise ValueError(f"No mesh geometry found in USD file: {path}")
 
-    return trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
+    mesh = trimesh.util.concatenate(parts) if len(parts) > 1 else parts[0]
+
+    # ── Attach UV + texture for USDZ files ────────────────────────────────────
+    # Merge UV arrays (use first part's UV for simplicity when concatenating)
+    merged_uv = all_uv[0] if len(all_uv) == 1 else None
+    if merged_uv is None and all(uv is not None for uv in all_uv):
+        try:
+            merged_uv = np.concatenate(all_uv, axis=0)
+            if len(merged_uv) != len(mesh.vertices):
+                merged_uv = None
+        except Exception:
+            merged_uv = None
+
+    # Extract largest image from USDZ ZIP
+    tex_img = None
+    import zipfile as _zf
+    if _zf.is_zipfile(str(path)):
+        try:
+            with _zf.ZipFile(str(path)) as zf:
+                img_entries = [(zi.file_size, zi.filename) for zi in zf.infolist()
+                               if zi.filename.lower().endswith((".jpg", ".jpeg", ".png"))]
+                if img_entries:
+                    img_entries.sort(reverse=True)  # largest first
+                    img_data = zf.read(img_entries[0][1])
+                    import io
+                    tex_img = Image.open(io.BytesIO(img_data)).convert("RGB")
+                    print(f"[usd] Loaded texture: {img_entries[0][1]} "
+                          f"({tex_img.size[0]}x{tex_img.size[1]})")
+        except Exception as e:
+            print(f"[usd] Could not extract texture from USDZ: {e}")
+
+    if tex_img is not None and merged_uv is not None:
+        mat = trimesh.visual.texture.SimpleMaterial(image=tex_img)
+        mesh.visual = trimesh.visual.texture.TextureVisuals(uv=merged_uv, material=mat)
+    elif tex_img is not None:
+        # Store texture without UV — _get_texture will still find it
+        mat = trimesh.visual.texture.SimpleMaterial(image=tex_img)
+        mesh.visual = trimesh.visual.texture.TextureVisuals(material=mat)
+
+    return mesh
 
 STABLEGEN_DIR = os.path.dirname(os.path.abspath(__file__))
 if STABLEGEN_DIR not in sys.path:
@@ -932,6 +1012,84 @@ def generate_view(server, args, cam_idx, depth_img=None, save_dir=None):
 
 # ── UV handling ───────────────────────────────────────────────────────────────
 
+def _get_texture(mesh):
+    """Return PIL Image embedded in the mesh's TextureVisuals, or None."""
+    vis = mesh.visual
+    if isinstance(vis, trimesh.visual.texture.TextureVisuals):
+        mat = vis.material
+        if hasattr(mat, "image") and mat.image is not None:
+            return mat.image.convert("RGB")
+    return None
+
+
+_TEXTURE_EXTS = (".png", ".jpg", ".jpeg", ".tga", ".bmp", ".tiff", ".dds")
+_TEXTURE_KEYWORDS = ("albedo", "color", "colour", "diffuse", "basecolor",
+                     "base_color", "texture", "tex", "col")
+
+def _find_mesh_texture(mesh_path):
+    """Search for a texture file in the same directory as the mesh.
+
+    Priority:
+      1. File referenced in a .mtl file next to the mesh (OBJ)
+      2. Image file whose name contains a texture keyword
+      3. Any image file in the same directory
+    Returns a PIL Image (RGB) or None.
+    """
+    mesh_dir  = os.path.dirname(os.path.abspath(mesh_path))
+    mesh_stem = os.path.splitext(os.path.basename(mesh_path))[0].lower()
+
+    def _load_img(p):
+        try:
+            if p.lower().endswith(".dds"):
+                try:
+                    import imageio  # type: ignore
+                    arr = imageio.imread(p)
+                    return Image.fromarray(arr).convert("RGB")
+                except Exception:
+                    pass
+            return Image.open(p).convert("RGB")
+        except Exception:
+            return None
+
+    # 1. Parse .mtl file (OBJ meshes)
+    mtl_path = os.path.join(mesh_dir, mesh_stem + ".mtl")
+    if not os.path.isfile(mtl_path):
+        # also check adjacent files with same stem
+        for fn in os.listdir(mesh_dir):
+            if fn.lower().endswith(".mtl"):
+                mtl_path = os.path.join(mesh_dir, fn)
+                break
+    if os.path.isfile(mtl_path):
+        with open(mtl_path, errors="ignore") as fh:
+            for line in fh:
+                tok = line.strip().split()
+                if len(tok) >= 2 and tok[0].lower() in ("map_kd", "map_ka", "map_d"):
+                    cand = os.path.join(mesh_dir, tok[-1].replace("\\", os.sep))
+                    img = _load_img(cand)
+                    if img:
+                        print(f"[texture] Found via MTL: {cand}")
+                        return img
+
+    # 2 & 3. Scan directory for image files
+    candidates = [f for f in os.listdir(mesh_dir)
+                  if os.path.splitext(f)[1].lower() in _TEXTURE_EXTS]
+    # Sort: keyword matches first, then stem matches, then alphabetical
+    def _score(fn):
+        fl = fn.lower()
+        if any(kw in fl for kw in _TEXTURE_KEYWORDS):
+            return 0
+        if mesh_stem in fl:
+            return 1
+        return 2
+    candidates.sort(key=_score)
+    for fn in candidates:
+        img = _load_img(os.path.join(mesh_dir, fn))
+        if img:
+            print(f"[texture] Found in mesh folder: {fn}")
+            return img
+    return None
+
+
 def _get_uv(mesh):
     """Return per-vertex UV array (n_verts, 2) or None."""
     vis = mesh.visual
@@ -1322,9 +1480,9 @@ def _parse_args():
                    help="Force spherical UV instead of mesh UVs or xatlas")
     p.add_argument("--upscale-result",      action="store_true",
                    help="Upscale the baked texture with an upscale model after generation")
-    p.add_argument("--upscale-texture",     metavar="FILE",
-                   help="Upscale an existing texture FILE via ComfyUI and re-export the mesh; "
-                        "skips all generation steps (requires --mesh)")
+    p.add_argument("--upscale-texture",     metavar="FILE", nargs="?", const="auto",
+                   help="Upscale texture via ComfyUI and re-export; omit FILE to use "
+                        "the texture embedded in the mesh; skips generation (requires --mesh)")
     p.add_argument("--upscale-model",       metavar="MODEL",
                    default="4x-UltraSharp.pth",
                    help="Upscale model in ComfyUI models/upscale_models/ "
@@ -1348,7 +1506,28 @@ def _parse_args():
                    help="Open an interactive pygame viewer after texturing completes")
     p.add_argument("--camera-gui",          action="store_true",
                    help="Show camera placement GUI before generation (Enter=proceed, Esc=abort)")
-    return p.parse_args()
+    p.add_argument("--config",              metavar="FILE",
+                   help="JSON config file; CLI args override config values")
+    args = p.parse_args()
+
+    # Apply config file: for each key in the JSON, use the config value only when
+    # the corresponding flag was NOT explicitly passed on the command line.
+    if args.config:
+        if not os.path.isfile(args.config):
+            p.error(f"config file not found: {args.config}")
+        with open(args.config) as _fh:
+            _cfg = json.load(_fh)
+        # Build set of flag names explicitly provided (e.g. "--camera-mode" → "camera_mode")
+        _cli_provided = set()
+        for _tok in sys.argv[1:]:
+            if _tok.startswith("--"):
+                _cli_provided.add(_tok.lstrip("-").replace("-", "_").split("=")[0])
+        for _key, _val in _cfg.items():
+            _dest = _key.replace("-", "_")
+            if _dest not in _cli_provided and hasattr(args, _dest):
+                setattr(args, _dest, _val)
+
+    return args
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1478,13 +1657,21 @@ def main():
 
     # 3b. --upscale-texture: skip generation, upscale an existing texture and re-export
     if args.upscale_texture:
-        if not os.path.isfile(args.upscale_texture):
-            print(f"[standalone] ERROR: texture not found: {args.upscale_texture}",
-                  file=sys.stderr)
-            sys.exit(1)
-        texture = Image.open(args.upscale_texture).convert("RGB")
-        print(f"[standalone] Upscaling {args.upscale_texture} "
-              f"({texture.size[0]}x{texture.size[1]}) with {args.upscale_model} ...")
+        if args.upscale_texture == "auto":
+            texture = _get_texture(mesh) or _find_mesh_texture(args.mesh)
+            if texture is None:
+                print("[standalone] ERROR: --upscale-texture: no texture found in mesh or mesh folder",
+                      file=sys.stderr)
+                sys.exit(1)
+            _ut_label = f"auto texture ({texture.size[0]}x{texture.size[1]})"
+        else:
+            if not os.path.isfile(args.upscale_texture):
+                print(f"[standalone] ERROR: texture not found: {args.upscale_texture}",
+                      file=sys.stderr)
+                sys.exit(1)
+            texture = Image.open(args.upscale_texture).convert("RGB")
+            _ut_label = f"{args.upscale_texture} ({texture.size[0]}x{texture.size[1]})"
+        print(f"[standalone] Upscaling {_ut_label} with {args.upscale_model} ...")
         texture = upscale_texture(args.server, texture, args.upscale_model,
                                   save_dir=args.output)
         export_textured_mesh(mesh, uv, texture, args.output, args.export)
