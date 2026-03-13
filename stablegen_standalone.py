@@ -261,8 +261,8 @@ def estimate_settings(mesh):
     """
     fn    = np.array(mesh.face_normals, dtype=np.float32)   # (F, 3)
     verts = np.array(mesh.vertices,     dtype=np.float32)   # (V, 3)
-    areas = np.array([f.area for f in mesh.faces_unique_edges], dtype=np.float32) \
-            if hasattr(mesh, 'faces_unique_edges') else \
+    areas = np.array(mesh.area_faces, dtype=np.float32) \
+            if hasattr(mesh, 'area_faces') else \
             np.ones(len(fn), dtype=np.float32)
     # Reliable face areas via cross product
     v0 = verts[mesh.faces[:, 0]]
@@ -420,6 +420,30 @@ def build_cameras(mesh, n_cameras, mode, render_w, render_h, yfov_deg=60.0):
         cameras.append({"pos": pos, "view": view, "proj": proj,
                          "yfov": yfov, "pose": pose})
     return cameras
+
+
+# ── Camera save / load ────────────────────────────────────────────────────────
+
+def _cameras_save_path(mesh_path):
+    """Return <mesh_stem>.cameras.json alongside the mesh file."""
+    base, _ = os.path.splitext(os.path.abspath(mesh_path))
+    return base + ".cameras.json"
+
+
+def _save_cameras(cameras, path):
+    data = []
+    for c in cameras:
+        data.append({k: v.tolist() if hasattr(v, "tolist") else v
+                     for k, v in c.items()})
+    with open(path, "w") as fh:
+        json.dump(data, fh)
+
+
+def _load_cameras(path):
+    with open(path) as fh:
+        data = json.load(fh)
+    return [{k: np.array(v) if isinstance(v, list) else v
+             for k, v in entry.items()} for entry in data]
 
 
 # ── Depth rendering with pyrender ─────────────────────────────────────────────
@@ -1406,26 +1430,34 @@ def main():
 
     # 4b. Optional camera placement GUI
     if args.camera_gui:
-        # Use mesh heuristics for the GUI starting values unless the user
-        # explicitly set those args on the command line.
-        _gui_suggested = estimate_settings(mesh)
-        _gui_init_n    = args.cameras    if "cameras"     in _explicit else _gui_suggested["cameras"]
-        _gui_init_mode = args.camera_mode if "camera_mode" in _explicit else _gui_suggested["camera_mode"]
-        if _gui_init_n != args.cameras or _gui_init_mode != args.camera_mode:
-            print(f"[camera-gui] heuristic start: {_gui_init_n} cams, "
-                  f"mode {_gui_init_mode} ({_gui_suggested['reasons']['cameras']}; "
-                  f"{_gui_suggested['reasons']['camera_mode']})")
-        _build_fn = lambda n, mode: build_cameras(
-            mesh, n, mode, args.width, args.height)
-        proceed, cameras = view_cameras(
-            mesh, cameras,
-            build_fn=_build_fn,
-            init_mode=_gui_init_mode,
-            init_n=_gui_init_n,
-        )
-        if not proceed:
-            print("[standalone] Aborted by user in camera GUI.")
-            sys.exit(0)
+        _cam_save = _cameras_save_path(args.mesh)
+        if os.path.exists(_cam_save):
+            cameras = _load_cameras(_cam_save)
+            print(f"[camera-gui] Loaded {len(cameras)} saved cameras from "
+                  f"{_cam_save}  (delete file to re-run GUI)")
+        else:
+            # Use mesh heuristics for the GUI starting values unless the user
+            # explicitly set those args on the command line.
+            _gui_suggested = estimate_settings(mesh)
+            _gui_init_n    = args.cameras    if "cameras"     in _explicit else _gui_suggested["cameras"]
+            _gui_init_mode = args.camera_mode if "camera_mode" in _explicit else _gui_suggested["camera_mode"]
+            if _gui_init_n != args.cameras or _gui_init_mode != args.camera_mode:
+                print(f"[camera-gui] heuristic start: {_gui_init_n} cams, "
+                      f"mode {_gui_init_mode} ({_gui_suggested['reasons']['cameras']}; "
+                      f"{_gui_suggested['reasons']['camera_mode']})")
+            _build_fn = lambda n, mode: build_cameras(
+                mesh, n, mode, args.width, args.height)
+            proceed, cameras = view_cameras(
+                mesh, cameras,
+                build_fn=_build_fn,
+                init_mode=_gui_init_mode,
+                init_n=_gui_init_n,
+            )
+            if not proceed:
+                print("[standalone] Aborted by user in camera GUI.")
+                sys.exit(0)
+            _save_cameras(cameras, _cam_save)
+            print(f"[camera-gui] Camera selection saved to {_cam_save}")
 
     # 5. Generate one image per camera
     gen_images = []
