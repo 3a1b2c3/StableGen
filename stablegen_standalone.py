@@ -1238,7 +1238,8 @@ def build_uv_3d_map(mesh, uv, tex_size):
 
 # ── Texture baking ────────────────────────────────────────────────────────────
 
-def bake_texture(pos_map, normal_map, valid_mask, cameras, gen_images, tex_size):
+def bake_texture(pos_map, normal_map, valid_mask, cameras, gen_images, tex_size,
+                 bilinear=True, angle_threshold=0.0, weight_exponent=2.0):
     """
     Vectorised multi-view texture baking.
 
@@ -1297,12 +1298,26 @@ def bake_texture(pos_map, normal_map, valid_mask, cameras, gen_images, tex_size)
             continue
 
         # --- Screen coordinates ---
-        sx = np.clip(( ndc[:, 0] * 0.5 + 0.5) * IW, 0, IW - 1).astype(int)
-        sy = np.clip((1 - (ndc[:, 1] * 0.5 + 0.5)) * IH, 0, IH - 1).astype(int)
+        sxf = np.clip(( ndc[:, 0] * 0.5 + 0.5) * IW, 0, IW - 1)
+        syf = np.clip((1 - (ndc[:, 1] * 0.5 + 0.5)) * IH, 0, IH - 1)
 
-        # --- Sample colours ---
-        colors = img_arr[sy, sx]           # (N, 3)
-        w_ang  = np.where(valid, dots, 0.0)
+        # --- Sample colours (bilinear or nearest) ---
+        if bilinear:
+            x0 = np.clip(sxf.astype(int),     0, IW - 1)
+            x1 = np.clip(x0 + 1,              0, IW - 1)
+            y0 = np.clip(syf.astype(int),     0, IH - 1)
+            y1 = np.clip(y0 + 1,              0, IH - 1)
+            fx = (sxf - x0)[:, None]
+            fy = (syf - y0)[:, None]
+            colors = (img_arr[y0, x0] * (1 - fx) * (1 - fy) +
+                      img_arr[y0, x1] *      fx  * (1 - fy) +
+                      img_arr[y1, x0] * (1 - fx) *      fy  +
+                      img_arr[y1, x1] *      fx  *      fy)
+        else:
+            colors = img_arr[syf.astype(int), sxf.astype(int)]
+
+        angle_mask = dots > angle_threshold
+        w_ang = np.where(valid & angle_mask, dots ** weight_exponent, 0.0)
 
         # Accumulate into texture
         idx_valid = np.where(valid)[0]
@@ -1474,6 +1489,13 @@ def _parse_args():
                    default="controlnet_depth_sdxl.safetensors")
     p.add_argument("--controlnet-strength", type=float,        default=0.6)
     p.add_argument("--save-views",          action="store_true")
+    p.add_argument("--bake-bilinear",       action="store_true", default=True,
+                   help="Bilinear sampling when baking (default: on)")
+    p.add_argument("--no-bake-bilinear",    action="store_false", dest="bake_bilinear")
+    p.add_argument("--bake-angle-threshold", type=float, default=0.0,
+                   help="Min cos(angle) to include a camera sample (0.0–1.0, default 0.0)")
+    p.add_argument("--bake-weight-exponent", type=float, default=2.0,
+                   help="Angle weight exponent — higher = sharper blending (default 2.0)")
     p.add_argument("--spherical-uv",        action="store_true",
                    help="Force spherical UV instead of mesh UVs or xatlas")
     p.add_argument("--upscale-result",      action="store_true",
@@ -1763,7 +1785,10 @@ def main():
     # 6. Build UV map and bake
     pos_map, normal_map, valid_mask = build_uv_3d_map(mesh, uv, args.tex_size)
     texture  = bake_texture(pos_map, normal_map, valid_mask,
-                            cameras, gen_images, args.tex_size)
+                            cameras, gen_images, args.tex_size,
+                            bilinear=args.bake_bilinear,
+                            angle_threshold=args.bake_angle_threshold,
+                            weight_exponent=args.bake_weight_exponent)
     coverage = bake_coverage_texture(pos_map, normal_map, valid_mask,
                                      cameras, args.tex_size)
     coverage.save(os.path.join(args.output, "debug_coverage.png"))
