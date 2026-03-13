@@ -556,14 +556,11 @@ def render_depth_view(mesh, cam, width, height):
     camera = pyrender.PerspectiveCamera(yfov=yfov, znear=znear, zfar=zfar)
     scene.add(camera, pose=cam["pose"])
 
-    try:
-        if sys.platform != "win32":
-            os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
-        renderer = pyrender.OffscreenRenderer(width, height)
-        _, depth = renderer.render(scene)
-        renderer.delete()
-    except Exception:
-        return None
+    if sys.platform != "win32":
+        os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
+    renderer = pyrender.OffscreenRenderer(width, height)
+    _, depth = renderer.render(scene)
+    renderer.delete()
 
     depth[depth == 0] = np.nan
     return depth.astype(np.float32)
@@ -1003,7 +1000,7 @@ def generate_view(server, args, cam_idx, depth_img=None, save_dir=None):
 
     img = Image.open(BytesIO(raw)).convert("RGB")
 
-    if save_dir and args.save_views:
+    if save_dir:
         p = os.path.abspath(os.path.join(save_dir, f"view_{cam_idx:02d}.png"))
         img.save(p)
         print(f"[debug_standalone] Saved: {p}")
@@ -1751,11 +1748,8 @@ def main():
         depth_img = None
         if _PYRENDER and not args.no_controlnet:
             depth = render_depth_view(mesh, cam, args.width, args.height)
-            if depth is not None:
-                depth_img = depth_to_image(depth)
-                print(f"[debug_standalone] Depth rendered")
-            else:
-                pass
+            depth_img = depth_to_image(depth)
+            print(f"[debug_standalone] Depth rendered")
 
         img = generate_view(args.server, args, ci, depth_img=depth_img,
                             save_dir=args.output)

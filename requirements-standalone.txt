@@ -7,6 +7,7 @@ websocket-client
 
 # stablegen_standalone.py — optional (depth ControlNet)
 pyrender
+pyopengl==3.1.5
 
 # stablegen_standalone.py — optional (pygame viewer / camera GUI)
 pygame
