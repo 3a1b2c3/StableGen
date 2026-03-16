@@ -29,7 +29,7 @@ _CAM_COLORS = [
 
 # ── Interactive viewer ────────────────────────────────────────────────────────
 
-def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_texture=None):
+def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, depth_images=None, coverage_texture=None):
     """
     Open a pygame/OpenGL window showing the textured mesh with a HUD overlay.
     Controls: left-drag = orbit, scroll = zoom, Esc/Q = close.
@@ -109,7 +109,9 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
     THUMB   = 96          # thumbnail height (and width, images are square)
     T_PAD   = 6           # gap between thumbnails / border
     T_LABEL = 16          # label height below each thumbnail
-    STRIP_H = THUMB + T_PAD * 2 + T_LABEL if gen_images else 0
+    _has_depth = depth_images and any(d is not None for d in depth_images)
+    _rows = (2 if _has_depth else 1) if gen_images else 0
+    STRIP_H = _rows * THUMB + T_PAD * (_rows + 1) + T_LABEL if gen_images else 0
     BTN_BAR_H = 36        # toggle button bar height
 
     # ── pygame / OpenGL init ───────────────────────────────────────────────────
@@ -185,6 +187,24 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
             thumb_ids.append((tid, lid, lw, lh))
+
+    # ── Upload depth thumbnails (second row) ───────────────────────────────────
+    depth_ids = []  # list of gl_id or None, one per camera
+    if _has_depth:
+        for di, dimg in enumerate(depth_images):
+            if dimg is None:
+                depth_ids.append(None)
+                continue
+            dthumb = dimg.resize((THUMB, THUMB)).convert("RGBA")
+            dd = np.ascontiguousarray(np.flipud(np.array(dthumb, dtype=np.uint8)))
+            dtid = _gen_tex()
+            glBindTexture(GL_TEXTURE_2D, dtid)
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, THUMB, THUMB,
+                         0, GL_RGBA, GL_UNSIGNED_BYTE, dd.tobytes())
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            depth_ids.append(dtid)
 
     # ── HUD helpers ────────────────────────────────────────────────────────────
     font_sm = pygame.font.SysFont("consolas", 14)
@@ -518,7 +538,8 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
             n     = len(thumb_ids)
             total = n * THUMB + (n - 1) * T_PAD
             x0    = max(T_PAD, (W - total) // 2)
-            ty    = H - STRIP_H + T_PAD           # top-left Y of thumbnails
+            ty    = H - STRIP_H + T_PAD           # top-left Y of gen thumbnails
+            dy    = ty + THUMB + T_PAD             # top-left Y of depth row
 
             glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
             glOrtho(0, W, H, 0, -1, 1)
@@ -553,6 +574,17 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
                 glTexCoord2f(0,0); glVertex2f(lx,      ly + lh)
                 glEnd()
 
+                # ── Depth thumbnail (second row, same column) ──────────────────
+                if depth_ids and ci < len(depth_ids) and depth_ids[ci] is not None:
+                    glColor4f(1, 1, 1, 0.85)
+                    glBindTexture(GL_TEXTURE_2D, depth_ids[ci])
+                    glBegin(GL_QUADS)
+                    glTexCoord2f(0,1); glVertex2f(tx,          dy)
+                    glTexCoord2f(1,1); glVertex2f(tx + THUMB,  dy)
+                    glTexCoord2f(1,0); glVertex2f(tx + THUMB,  dy + THUMB)
+                    glTexCoord2f(0,0); glVertex2f(tx,          dy + THUMB)
+                    glEnd()
+
             glDisable(GL_BLEND); glDisable(GL_TEXTURE_2D)
             glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING)
             glMatrixMode(GL_PROJECTION); glPopMatrix()
@@ -567,6 +599,10 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
         for entry in thumb_ids:
             if entry:
                 glDeleteTextures([entry[0], entry[1]])
+    if depth_ids:
+        for dtid in depth_ids:
+            if dtid is not None:
+                glDeleteTextures([dtid])
     pygame.quit()
 
 
@@ -1221,4 +1257,4 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None, texture
     if mesh_tex_id is not None:
         glDeleteTextures([mesh_tex_id])
     pygame.quit()
-    return proceed, cameras
+    return proceed, cameras, mode_int, n_cams

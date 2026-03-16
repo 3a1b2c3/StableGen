@@ -2093,6 +2093,10 @@ def main():
     print(f"[standalone] pyrender  : {'yes' if _PYRENDER else 'no (pip install pyrender)'}")
     print(f"[standalone] xatlas    : {'yes' if _XATLAS else 'no (pip install xatlas)'}")
 
+    if os.path.isdir(args.output) and os.listdir(args.output):
+        import shutil
+        shutil.rmtree(args.output)
+        print(f"[standalone] Cleared output folder: {args.output}")
     os.makedirs(args.output, exist_ok=True)
 
     # 3. UV
@@ -2163,7 +2167,7 @@ def main():
         _build_fn = lambda n, mode: build_cameras(mesh, n, mode, args.width, args.height)
         _cam_gui_texture = _get_texture(mesh) or _find_mesh_texture(args.mesh)
         print(f"[camera-gui] Opening GUI with {len(_saved_cameras)} cameras ...")
-        proceed, cameras = view_cameras(
+        proceed, cameras, _gui_final_mode, _gui_final_n = view_cameras(
             mesh, _saved_cameras,
             build_fn=_build_fn,
             init_mode=_gui_init_mode,
@@ -2174,11 +2178,14 @@ def main():
         if not proceed:
             print("[standalone] Aborted by user in camera GUI.")
             sys.exit(0)
-        _save_cameras(cameras, _cam_save, mode=_gui_init_mode, n=len(cameras))
+        _save_cameras(cameras, _cam_save, mode=_gui_final_mode, n=_gui_final_n)
+        args.cameras = _gui_final_n
+        args.camera_mode = _gui_final_mode
         print(f"[debug_camera-gui] Camera selection saved to {_cam_save}")
 
     # 5. Generate one image per camera
-    gen_images = []
+    gen_images   = []
+    depth_images = []
     view_warnings = []
     _reference_img = None   # set to view-0 when --img2img-views is active
 
@@ -2218,15 +2225,17 @@ def main():
             print(f"[standalone] ERROR: camera {ci+1} generation failed", file=sys.stderr)
             sys.exit(1)
         print(f"[debug_standalone] Image: {img.size}")
-        if depth_img is not None:
-            d = depth_img.resize(img.size)
-            side = Image.new("RGB", (img.width * 2, img.height))
-            side.paste(d, (0, 0))
-            side.paste(img, (img.width, 0))
-            side.show()
-        else:
-            img.show()
+        if args.output:
+            img.save(os.path.join(args.output, f"debug_view_{ci:02d}.png"))
+            if depth_img is not None:
+                depth_img.save(os.path.join(args.output, f"debug_depth_{ci:02d}.png"))
+                d = depth_img.resize(img.size)
+                combined = Image.new("RGB", (img.width * 2, img.height))
+                combined.paste(d, (0, 0))
+                combined.paste(img, (img.width, 0))
+                combined.save(os.path.join(args.output, f"debug_combined_{ci:02d}.png"))
         gen_images.append(img)
+        depth_images.append(depth_img)
 
     # 6. Build UV map and bake
     pos_map, normal_map, valid_mask = build_uv_3d_map(mesh, uv, args.tex_size)
@@ -2255,6 +2264,7 @@ def main():
         view_result(mesh, uv, texture,
                     warnings=view_warnings or None,
                     gen_images=gen_images,
+                    depth_images=depth_images,
                     coverage_texture=coverage)
 
 
