@@ -1909,6 +1909,12 @@ def _parse_args():
                    help="Show camera placement GUI before generation (Enter=proceed, Esc=abort)")
     p.add_argument("--config",              metavar="FILE",
                    help="JSON config file; CLI args override config values")
+    p.add_argument("--img2img-views",        action="store_true",
+                   help="Use the first generated view as img2img reference for all "
+                        "subsequent views (improves cross-view consistency)")
+    p.add_argument("--img2img-denoise",      type=float, default=0.65,
+                   help="Denoise strength for img2img views (default: 0.65, range 0–1; "
+                        "lower = closer to reference, higher = more creative)")
     p.add_argument("--qwen-prompt",         action="store_true",
                    help="Auto-generate --prompt from mesh using Qwen VLM (ignores --prompt if set)")
     p.add_argument("--qwen-model",          metavar="MODEL",
@@ -2174,11 +2180,15 @@ def main():
     # 5. Generate one image per camera
     gen_images = []
     view_warnings = []
+    _reference_img = None   # set to view-0 when --img2img-views is active
 
     if not _PYRENDER:
         view_warnings.append("pyrender not installed — depth ControlNet skipped")
     if not _XATLAS and args.spherical_uv:
         view_warnings.append("xatlas not installed — spherical UV used")
+    if getattr(args, "img2img_views", False):
+        print(f"[standalone] img2img-views ON  (denoise={args.img2img_denoise}) — "
+              f"view 0 is free txt2img, views 1+ conditioned on it")
 
     for ci, cam in enumerate(cameras):
         print(f"\n[standalone] -- Camera {ci+1}/{len(cameras)} --")
@@ -2194,8 +2204,16 @@ def main():
             dp = os.path.abspath(os.path.join(args.output, f"depth_{ci:02d}.png"))
             depth_img.save(dp)
 
+        # Pass reference only for views 1+ when --img2img-views is active
+        ref = _reference_img if (getattr(args, "img2img_views", False) and ci > 0) else None
+
         img = generate_view(args.server, args, ci, depth_img=depth_img,
-                            save_dir=args.output)
+                            save_dir=args.output, reference_img=ref)
+
+        # Store view 0 as the style reference for subsequent views
+        if img is not None and ci == 0 and getattr(args, "img2img_views", False):
+            _reference_img = img
+            print(f"[standalone] View 0 saved as style reference for img2img")
         if img is None:
             print(f"[standalone] ERROR: camera {ci+1} generation failed", file=sys.stderr)
             sys.exit(1)
