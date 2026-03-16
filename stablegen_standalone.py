@@ -10,6 +10,18 @@ Pipeline:
   6. Export textured mesh (GLB / OBJ+MTL)
 
 Usage (from PS C:\\workspace\\MODEL\\StableGen):
+    # Use config file (all settings from stablegen_config.json, mesh overridden on CLI):
+    .\\.venv\\Scripts\\python.exe stablegen_standalone.py `
+        --config stablegen_config.json `
+        --mesh sphere.obj
+
+    # Auto-generate prompt via Qwen VLM (set qwen_prompt=true in config, or pass flag):
+    .\\.venv\\Scripts\\python.exe stablegen_standalone.py `
+        --config stablegen_config.json `
+        --mesh sphere.obj `
+        --qwen-prompt
+
+    # Manual prompt, no config:
     .\\.venv\\Scripts\\python.exe stablegen_standalone.py `
         --mesh sphere.obj `
         --prompt "ancient stone wall with moss" `
@@ -18,6 +30,60 @@ Usage (from PS C:\\workspace\\MODEL\\StableGen):
 
     # Check ComfyUI is reachable first:
     .\\.venv\\Scripts\\python.exe stablegen_standalone.py --check
+
+    # List and download checkpoints:
+    .\\.venv\\Scripts\\python.exe stablegen_standalone.py --list-checkpoints
+    .\\.venv\\Scripts\\python.exe stablegen_standalone.py `
+        --download-checkpoint RealVisXL_V5.0_fp16.safetensors `
+        --comfyui-dir C:\\workspace\\MODEL\\ComfyUI
+
+    # List and download upscale models:
+    .\\.venv\\Scripts\\python.exe stablegen_standalone.py --list-upscalers
+    .\\.venv\\Scripts\\python.exe stablegen_standalone.py `
+        --download-upscaler 4x-UltraSharp.pth `
+        --comfyui-dir C:\\workspace\\MODEL\\ComfyUI
+
+    # Suggest camera settings for a mesh without generating:
+    .\\.venv\\Scripts\\python.exe stablegen_standalone.py --mesh mycar.glb --suggest
+
+    # Full run, no ControlNet, custom output dir:
+    .\\.venv\\Scripts\\python.exe stablegen_standalone.py `
+        --mesh mycar.glb `
+        --prompt "red racing car, dirty, scratched paint" `
+        --no-controlnet `
+        --output ./sg_out_car
+
+    # Full run using config file (mesh, prompt and output override config):
+    .\\.venv\\Scripts\\python.exe stablegen_standalone.py `
+        --config configs\\stablegen_config_RealVisXL.json `
+        --mesh mycar.glb `
+        --prompt "red racing car, dirty, scratched paint" `
+        --output ./sg_out_car `
+        --camera-gui `
+        --save-views
+
+    # Full run with all arguments explicit (no config):
+    .\\.venv\\Scripts\\python.exe stablegen_standalone.py `
+        --mesh mycar.glb `
+        --prompt "red racing car, dirty, scratched paint" `
+        --negative "blurry, watermark, text" `
+        --checkpoint RealVisXL_V5.0_fp16.safetensors `
+        --server 127.0.0.1:8188 `
+        --cameras 6 `
+        --camera-mode 5 `
+        --steps 20 `
+        --cfg 7.0 `
+        --seed -1 `
+        --width 1024 `
+        --height 1024 `
+        --tex-size 1024 `
+        --controlnet controlnet-depth-sdxl-1.0-small `
+        --controlnet-strength 0.6 `
+        --bake-weight-exponent 2.0 `
+        --bake-angle-threshold 0.0 `
+        --export glb `
+        --output ./sg_out_car `
+        --save-views
 
 Dependencies:
     .\\.venv\\Scripts\\python.exe -m pip install trimesh pillow numpy requests websocket-client
@@ -1013,9 +1079,92 @@ def upscale_texture(server, texture_img, upscale_model, save_dir=None):
             os.remove(tmp)
 
 
-def generate_view(server, args, cam_idx, depth_img=None, save_dir=None):
+def _build_sdxl_img2img(prompt, negative, checkpoint, ref_image_name,
+                        denoise, steps, cfg, seed, width, height):
+    """img2img workflow: encode reference image, denoise towards prompt."""
+    if seed < 0:
+        seed = random.randint(0, 2**31)
+    return {
+        "1":  {"class_type": "CheckpointLoaderSimple",
+               "inputs": {"ckpt_name": checkpoint}},
+        "2":  {"class_type": "CLIPTextEncode",
+               "inputs": {"text": prompt, "clip": ["1", 1]}},
+        "3":  {"class_type": "CLIPTextEncode",
+               "inputs": {"text": negative, "clip": ["1", 1]}},
+        "10": {"class_type": "LoadImage",
+               "inputs": {"image": ref_image_name}},
+        "11": {"class_type": "ImageScale",
+               "inputs": {"image": ["10", 0], "width": width, "height": height,
+                          "upscale_method": "lanczos", "crop": "disabled"}},
+        "12": {"class_type": "VAEEncode",
+               "inputs": {"pixels": ["11", 0], "vae": ["1", 2]}},
+        "5":  {"class_type": "KSampler",
+               "inputs": {"model": ["1", 0], "positive": ["2", 0],
+                          "negative": ["3", 0], "latent_image": ["12", 0],
+                          "seed": seed, "steps": steps, "cfg": cfg,
+                          "sampler_name": "euler", "scheduler": "karras",
+                          "denoise": denoise}},
+        "6":  {"class_type": "VAEDecode",
+               "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+        "7":  {"class_type": "SaveImageWebsocket",
+               "inputs": {"images": ["6", 0]}},
+    }
+
+
+def _build_sdxl_img2img_controlnet(prompt, negative, checkpoint,
+                                   controlnet_model, controlnet_strength,
+                                   ref_image_name, depth_image_name,
+                                   denoise, steps, cfg, seed, width, height):
+    """img2img + depth ControlNet: reference image style + depth structure."""
+    if seed < 0:
+        seed = random.randint(0, 2**31)
+    return {
+        "1":  {"class_type": "CheckpointLoaderSimple",
+               "inputs": {"ckpt_name": checkpoint}},
+        "2":  {"class_type": "CLIPTextEncode",
+               "inputs": {"text": prompt, "clip": ["1", 1]}},
+        "3":  {"class_type": "CLIPTextEncode",
+               "inputs": {"text": negative, "clip": ["1", 1]}},
+        # ControlNet depth
+        "10": {"class_type": "ControlNetLoader",
+               "inputs": {"control_net_name": controlnet_model}},
+        "11": {"class_type": "LoadImage",
+               "inputs": {"image": depth_image_name}},
+        "12": {"class_type": "ControlNetApplyAdvanced",
+               "inputs": {"positive": ["2", 0], "negative": ["3", 0],
+                          "control_net": ["10", 0], "image": ["11", 0],
+                          "strength": controlnet_strength,
+                          "start_percent": 0.0, "end_percent": 1.0}},
+        # Reference image encode
+        "20": {"class_type": "LoadImage",
+               "inputs": {"image": ref_image_name}},
+        "21": {"class_type": "ImageScale",
+               "inputs": {"image": ["20", 0], "width": width, "height": height,
+                          "upscale_method": "lanczos", "crop": "disabled"}},
+        "22": {"class_type": "VAEEncode",
+               "inputs": {"pixels": ["21", 0], "vae": ["1", 2]}},
+        "5":  {"class_type": "KSampler",
+               "inputs": {"model": ["1", 0], "positive": ["12", 0],
+                          "negative": ["12", 1], "latent_image": ["22", 0],
+                          "seed": seed, "steps": steps, "cfg": cfg,
+                          "sampler_name": "euler", "scheduler": "karras",
+                          "denoise": denoise}},
+        "6":  {"class_type": "VAEDecode",
+               "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+        "7":  {"class_type": "SaveImageWebsocket",
+               "inputs": {"images": ["6", 0]}},
+    }
+
+
+def generate_view(server, args, cam_idx, depth_img=None, save_dir=None,
+                  reference_img=None):
     """
     Generate one camera-view image via ComfyUI.
+
+    When *reference_img* is provided (a PIL.Image from a previously generated
+    view), subsequent views are run as img2img conditioned on it so that
+    colour and style stay consistent across views.
+
     Returns PIL.Image (RGB) or None on failure.
     """
     seed = args.seed if args.seed >= 0 else random.randint(0, 2**31)
@@ -1033,7 +1182,33 @@ def generate_view(server, args, cam_idx, depth_img=None, save_dir=None):
             print(f"[debug_standalone] depth upload failed: {e}", file=sys.stderr)
             depth_name = None
 
-    if depth_name:
+    ref_name = None
+    if reference_img is not None:
+        tmp_ref = os.path.join(save_dir or ".", "_ref_view.png")
+        reference_img.save(tmp_ref)
+        try:
+            info = _upload_image(server, tmp_ref)
+            ref_name = info.get("name") if info else None
+        except Exception as e:
+            print(f"[debug_standalone] reference upload failed: {e}", file=sys.stderr)
+            ref_name = None
+
+    denoise = getattr(args, "img2img_denoise", 0.65)
+
+    if ref_name and depth_name:
+        wf = _build_sdxl_img2img_controlnet(
+            args.prompt, args.negative, args.checkpoint,
+            args.controlnet, args.controlnet_strength,
+            ref_name, depth_name,
+            denoise, args.steps, args.cfg, seed, args.width, args.height,
+        )
+    elif ref_name:
+        wf = _build_sdxl_img2img(
+            args.prompt, args.negative, args.checkpoint,
+            ref_name, denoise,
+            args.steps, args.cfg, seed, args.width, args.height,
+        )
+    elif depth_name:
         wf = _build_sdxl_controlnet_depth(
             args.prompt, args.negative, args.checkpoint,
             args.controlnet, args.controlnet_strength,
@@ -2015,13 +2190,24 @@ def main():
             depth_img = depth_to_image(depth)
             print(f"[debug_standalone] Depth rendered")
 
+        if depth_img is not None and args.output:
+            dp = os.path.abspath(os.path.join(args.output, f"depth_{ci:02d}.png"))
+            depth_img.save(dp)
+
         img = generate_view(args.server, args, ci, depth_img=depth_img,
                             save_dir=args.output)
         if img is None:
             print(f"[standalone] ERROR: camera {ci+1} generation failed", file=sys.stderr)
             sys.exit(1)
         print(f"[debug_standalone] Image: {img.size}")
-        img.show()
+        if depth_img is not None:
+            d = depth_img.resize(img.size)
+            side = Image.new("RGB", (img.width * 2, img.height))
+            side.paste(d, (0, 0))
+            side.paste(img, (img.width, 0))
+            side.show()
+        else:
+            img.show()
         gen_images.append(img)
 
     # 6. Build UV map and bake

@@ -1,5 +1,6 @@
 {
     "mesh": "C:/workspace/MODEL/data/BanhMi_Cart.usdz",
+    "checkpoint": "RealVisXL_V5.0_fp16.safetensors",
     "prompt": "a worn street vendor cart",
     "negative": "",
     "cameras": 6,
@@ -21,11 +22,12 @@
     "bake_weight_exponent": 2.0,
     "save_views": false,
     "spherical_uv": false,
+    "upscale_model": "4x-UltraSharp.pth",
     "upscale_result": false,
-    "view": false,
+    "view": true,
     "camera_gui": true,
     "auto": false,
     "qwen_prompt": false,
     "qwen_model": "qwen2.5-vl-7b",
-    "comfyui_dir": ""
+    "comfyui_dir": "C:/workspace/MODEL/ComfyUI"
 }
