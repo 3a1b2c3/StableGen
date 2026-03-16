@@ -1484,7 +1484,8 @@ def build_uv_3d_map(mesh, uv, tex_size):
 # ── Texture baking ────────────────────────────────────────────────────────────
 
 def bake_texture(pos_map, normal_map, valid_mask, cameras, gen_images, tex_size,
-                 bilinear=True, angle_threshold=0.0, weight_exponent=2.0):
+                 bilinear=True, angle_threshold=0.0, weight_exponent=2.0,
+                 depth_arrays=None, return_weights=False):
     """
     Vectorised multi-view texture baking.
 
@@ -1546,6 +1547,22 @@ def bake_texture(pos_map, normal_map, valid_mask, cameras, gen_images, tex_size,
         sxf = np.clip(( ndc[:, 0] * 0.5 + 0.5) * IW, 0, IW - 1)
         syf = np.clip((1 - (ndc[:, 1] * 0.5 + 0.5)) * IH, 0, IH - 1)
 
+        # --- Bilateral depth test: texel must match rendered surface depth ---
+        # Rejects surfaces behind other geometry AND thin back-faces nearly
+        # co-planar with a front surface (same-projection artifact).
+        if depth_arrays is not None and ci < len(depth_arrays) and depth_arrays[ci] is not None:
+            raw_depth = depth_arrays[ci]          # (DH, DW) float32, NaN=background
+            DH, DW    = raw_depth.shape
+            texel_z   = -P_cam[:, 2]              # metric depth (OpenGL: camera looks -Z)
+            dx = np.clip((sxf / IW * DW).astype(int), 0, DW - 1)
+            dy = np.clip((syf / IH * DH).astype(int), 0, DH - 1)
+            surf_z = raw_depth[dy, dx]
+            # Accept only if texel depth matches rendered surface within 1% + 1 mm.
+            # Two-sided: rejects both occluded back surfaces AND foreground ghosts.
+            tol = np.maximum(surf_z * 0.01, 1e-3)
+            depth_match = np.isnan(surf_z) | (np.abs(texel_z - surf_z) <= tol)
+            valid = valid & depth_match
+
         # --- Sample colours (bilinear or nearest) ---
         if bilinear:
             x0 = np.clip(sxf.astype(int),     0, IW - 1)
@@ -1589,7 +1606,8 @@ def bake_texture(pos_map, normal_map, valid_mask, cameras, gen_images, tex_size,
         tex[unfilled] = tex[nearest_idx[0][unfilled], nearest_idx[1][unfilled]]
         print(f"[debug_standalone] Dilation: filled {unfilled.sum():,} border texels")
 
-    return Image.fromarray(tex, "RGB")
+    result = Image.fromarray(tex, "RGB")
+    return (result, wts) if return_weights else result
 
 
 def bake_coverage_texture(pos_map, normal_map, valid_mask, cameras, tex_size):
@@ -2186,6 +2204,7 @@ def main():
     # 5. Generate one image per camera
     gen_images   = []
     depth_images = []
+    depth_arrays = []   # raw float32 depth maps for occlusion testing
     view_warnings = []
     _reference_img = None   # set to view-0 when --img2img-views is active
 
@@ -2202,9 +2221,10 @@ def main():
 
         # Render depth (optional)
         depth_img = None
+        depth_raw = None
         if _PYRENDER and not args.no_controlnet:
-            depth = render_depth_view(mesh, cam, args.width, args.height)
-            depth_img = depth_to_image(depth)
+            depth_raw = render_depth_view(mesh, cam, args.width, args.height)
+            depth_img = depth_to_image(depth_raw)
             print(f"[debug_standalone] Depth rendered")
 
         if depth_img is not None and args.output:
@@ -2236,14 +2256,65 @@ def main():
                 combined.save(os.path.join(args.output, f"debug_combined_{ci:02d}.png"))
         gen_images.append(img)
         depth_images.append(depth_img)
+        depth_arrays.append(depth_raw)
 
     # 6. Build UV map and bake
     pos_map, normal_map, valid_mask = build_uv_3d_map(mesh, uv, args.tex_size)
-    texture  = bake_texture(pos_map, normal_map, valid_mask,
+    texture, bake_wts = bake_texture(pos_map, normal_map, valid_mask,
                             cameras, gen_images, args.tex_size,
                             bilinear=args.bake_bilinear,
                             angle_threshold=args.bake_angle_threshold,
-                            weight_exponent=args.bake_weight_exponent)
+                            weight_exponent=args.bake_weight_exponent,
+                            depth_arrays=depth_arrays,
+                            return_weights=True)
+
+    # Recovery camera: if >5% of valid texels are unpainted after depth-tested bake,
+    # add one extra camera aimed at the uncovered region's centroid and re-bake.
+    uncovered_mask = valid_mask & (bake_wts == 0)
+    uncov_frac = float(uncovered_mask.sum()) / max(float(valid_mask.sum()), 1)
+    print(f"[standalone] Uncovered texels after bake: {uncov_frac*100:.1f}%")
+    if uncov_frac > 0.05 and _PYRENDER:
+        print(f"[standalone] Adding recovery camera for uncovered region ...")
+        uncov_pos = pos_map[uncovered_mask]     # (N, 3) world positions
+        uncov_nrm = normal_map[uncovered_mask]  # (N, 3) normals
+        nrm_len = np.linalg.norm(uncov_nrm, axis=1, keepdims=True)
+        uncov_nrm = uncov_nrm / (nrm_len + 1e-10)
+        # Best camera direction = weighted average of uncovered face normals
+        rec_dir = uncov_nrm.mean(axis=0)
+        rec_dir /= np.linalg.norm(rec_dir) + 1e-10
+        centroid  = mesh.centroid
+        radius    = np.linalg.norm(mesh.extents) * 0.8 + 1e-6
+        rec_pos   = centroid + radius * rec_dir
+        rec_view, rec_pose = _look_at(rec_pos, centroid)
+        rec_proj  = _perspective_matrix(cameras[0]["yfov"],
+                                        args.width / args.height)
+        rec_cam   = {"pos": rec_pos, "view": rec_view, "proj": rec_proj,
+                     "yfov": cameras[0]["yfov"], "pose": rec_pose}
+        rec_depth_raw = render_depth_view(mesh, rec_cam, args.width, args.height)
+        rec_depth_img = depth_to_image(rec_depth_raw) if rec_depth_raw is not None else None
+        rec_ci = len(gen_images)
+        rec_img = generate_view(args.server, args, rec_ci,
+                                depth_img=rec_depth_img, save_dir=args.output)
+        if rec_img is not None:
+            if args.output:
+                rec_img.save(os.path.join(args.output, f"debug_view_{rec_ci:02d}_recovery.png"))
+            # Bake recovery camera only into previously uncovered texels
+            rec_valid_mask = uncovered_mask
+            rec_tex, _ = bake_texture(pos_map, normal_map, rec_valid_mask,
+                                      [rec_cam], [rec_img], args.tex_size,
+                                      bilinear=args.bake_bilinear,
+                                      angle_threshold=args.bake_angle_threshold,
+                                      weight_exponent=args.bake_weight_exponent,
+                                      depth_arrays=[rec_depth_raw],
+                                      return_weights=True)
+            # Composite: paste recovery result into uncovered region of main texture
+            tex_arr = np.array(texture)
+            rec_arr = np.array(rec_tex)
+            uncov_2d = uncovered_mask
+            tex_arr[uncov_2d] = rec_arr[uncov_2d]
+            texture = Image.fromarray(tex_arr, "RGB")
+            print(f"[standalone] Recovery camera baked into uncovered region.")
+
     coverage = bake_coverage_texture(pos_map, normal_map, valid_mask,
                                      cameras, args.tex_size)
     coverage.save(os.path.join(args.output, "debug_coverage.png"))
