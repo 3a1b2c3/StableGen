@@ -24,5 +24,9 @@
     "spherical_uv": false,
     "upscale_result": false,
     "view": false,
-    "camera_gui": false
+    "camera_gui": false,
+    "auto": false,
+    "qwen_prompt": false,
+    "qwen_model": "qwen2.5-vl-7b",
+    "comfyui_dir": ""
 }

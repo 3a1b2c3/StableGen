@@ -174,3 +174,4 @@ cython_debug/
 .pypirc
 stablegen/feather.oso
 stablegen.zip
+sg_out_*/

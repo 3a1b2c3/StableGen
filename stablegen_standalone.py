@@ -834,6 +834,76 @@ _UPSCALE_MODELS = {
     },
 }
 
+_CHECKPOINT_MODELS = {
+    "RealVisXL_V5.0_fp16.safetensors": {
+        "url":  "https://huggingface.co/SG161222/RealVisXL_V5.0/resolve/main/RealVisXL_V5.0_fp16.safetensors",
+        "desc": "Photorealistic SDXL — recommended for textures (default)",
+        "size": "~6.5 GB",
+    },
+    "sd_xl_base_1.0.safetensors": {
+        "url":  "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors",
+        "desc": "SDXL Base 1.0 — vanilla baseline, predictable",
+        "size": "~6.9 GB",
+    },
+}
+
+
+def download_checkpoint(model_name, dest_dir):
+    """Download a known SDXL checkpoint into dest_dir with a progress bar.
+    dest_dir should be ComfyUI's models/checkpoints/ folder.
+    Returns the saved file path, or None on failure.
+    """
+    if model_name not in _CHECKPOINT_MODELS:
+        print(f"[download] Unknown checkpoint '{model_name}'.", file=sys.stderr)
+        print(f"[download] Known checkpoints:", file=sys.stderr)
+        for name, info in _CHECKPOINT_MODELS.items():
+            print(f"             {name}  — {info['desc']}", file=sys.stderr)
+        return None
+
+    entry    = _CHECKPOINT_MODELS[model_name]
+    url      = entry["url"]
+    out_path = os.path.join(dest_dir, model_name)
+
+    if os.path.exists(out_path):
+        print(f"[download] Already exists: {out_path}")
+        return out_path
+
+    os.makedirs(dest_dir, exist_ok=True)
+    print(f"[download] {model_name}  ({entry['size']})  {entry['desc']}")
+    print(f"[download] → {out_path}")
+
+    try:
+        resp = requests.get(url, stream=True, timeout=60,
+                            headers={"User-Agent": "stablegen-standalone/1.0"})
+        resp.raise_for_status()
+        total      = int(resp.headers.get("content-length", 0))
+        downloaded = 0
+        bar_width  = 40
+
+        with open(out_path, "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                fh.write(chunk)
+                downloaded += len(chunk)
+                if total:
+                    frac     = downloaded / total
+                    filled   = int(bar_width * frac)
+                    bar      = "#" * filled + "-" * (bar_width - filled)
+                    mb       = downloaded / (1024 ** 2)
+                    total_mb = total      / (1024 ** 2)
+                    print(f"\r  [{bar}] {mb:.1f}/{total_mb:.1f} MB",
+                          end="", flush=True)
+        print()
+        print(f"[download] Saved: {out_path}")
+        return out_path
+
+    except Exception as e:
+        print(f"\n[download] Failed: {e}", file=sys.stderr)
+        if os.path.exists(out_path):
+            os.remove(out_path)
+        return None
+
 
 def download_upscaler(model_name, dest_dir):
     """
@@ -1334,6 +1404,16 @@ def bake_texture(pos_map, normal_map, valid_mask, cameras, gen_images, tex_size,
     tex[mask] /= wts[mask, np.newaxis]
     tex = np.clip(tex, 0, 255).astype(np.uint8)
     print(f"[debug_standalone] Bake complete: {mask.sum():,} texels filled")
+
+    # Dilate filled texels into unfilled UV island border texels to prevent
+    # black seams at UV island edges (especially visible when mipmapped).
+    unfilled = ~mask
+    if unfilled.any():
+        from scipy.ndimage import distance_transform_edt
+        _, nearest_idx = distance_transform_edt(unfilled, return_indices=True)
+        tex[unfilled] = tex[nearest_idx[0][unfilled], nearest_idx[1][unfilled]]
+        print(f"[debug_standalone] Dilation: filled {unfilled.sum():,} border texels")
+
     return Image.fromarray(tex, "RGB")
 
 
@@ -1459,6 +1539,128 @@ def export_textured_mesh(mesh, uv, texture_img, output_dir, fmt):
 from stablegen_viewer import view_result, view_cameras
 
 
+# ── Qwen VLM prompt generation ─────────────────────────────────────────────
+
+_QWEN_MODELS = {
+    "qwen2.5-vl-3b":  "Qwen/Qwen2.5-VL-3B-Instruct",
+    "qwen2.5-vl-7b":  "Qwen/Qwen2.5-VL-7B-Instruct",
+    "qwen2.5-vl-72b": "Qwen/Qwen2.5-VL-72B-Instruct",
+    "qwen2-vl-2b":    "Qwen/Qwen2-VL-2B-Instruct",
+    "qwen2-vl-7b":    "Qwen/Qwen2-VL-7B-Instruct",
+    "qwen2-vl-72b":   "Qwen/Qwen2-VL-72B-Instruct",
+}
+
+_QWEN_PROMPT_QUESTION = (
+    "This is a rendered view of a 3D mesh. "
+    "Describe what material or texture this object should have for AI image generation. "
+    "Reply with a short descriptive prompt for Stable Diffusion "
+    "(e.g. 'ancient stone wall, mossy, weathered, photorealistic'). "
+    "No explanation — just the prompt."
+)
+
+
+def _render_mesh_preview(mesh, width=512, height=512):
+    """Render a simple shaded preview of the mesh. Returns PIL.Image or None."""
+    if _PYRENDER:
+        try:
+            scene = pyrender.Scene(
+                bg_color=[0.15, 0.15, 0.15, 1.0],
+                ambient_light=[0.4, 0.4, 0.4],
+            )
+            mesh_py = pyrender.Mesh.from_trimesh(mesh, smooth=True)
+            scene.add(mesh_py)
+            centroid = mesh.centroid
+            extents  = mesh.extents
+            radius   = np.linalg.norm(extents) * 1.2 + 1e-6
+            cam_pos  = centroid + np.array([0.0, -radius, radius * 0.6])
+            _, pose  = _look_at(cam_pos, centroid)
+            camera   = pyrender.PerspectiveCamera(yfov=math.radians(60))
+            scene.add(camera, pose=pose)
+            light = pyrender.DirectionalLight(color=[1, 1, 1], intensity=4.0)
+            scene.add(light, pose=pose)
+            if sys.platform != "win32":
+                os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
+            renderer = pyrender.OffscreenRenderer(width, height)
+            color, _ = renderer.render(scene)
+            renderer.delete()
+            return Image.fromarray(color)
+        except Exception as e:
+            print(f"[qwen] pyrender preview failed: {e}", file=sys.stderr)
+
+    # Fallback: trimesh scene screenshot
+    try:
+        scene = trimesh.scene.Scene([mesh])
+        data  = scene.save_image(resolution=(width, height))
+        if data:
+            from io import BytesIO as _BytesIO
+            return Image.open(_BytesIO(data)).convert("RGB")
+    except Exception as e:
+        print(f"[qwen] trimesh preview failed: {e}", file=sys.stderr)
+    return None
+
+
+def qwen_generate_prompt(mesh, model_key="qwen2.5-vl-7b"):
+    """
+    Render a preview of *mesh*, pass it to a Qwen2.5-VL model and return a
+    descriptive texture-generation prompt string, or None on failure.
+    """
+    try:
+        import torch
+        from transformers import AutoProcessor, AutoModelForVision2Seq
+    except ImportError:
+        print("[qwen] ERROR: transformers / torch not installed.", file=sys.stderr)
+        return None
+
+    model_id = _QWEN_MODELS.get(model_key, model_key)
+    print(f"[qwen] Loading {model_id} ...")
+
+    try:
+        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        model = AutoModelForVision2Seq.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device_map="auto",
+        )
+    except Exception as e:
+        print(f"[qwen] ERROR loading model: {e}", file=sys.stderr)
+        return None
+
+    preview = _render_mesh_preview(mesh)
+    if preview is None:
+        print("[qwen] WARNING: could not render mesh preview; using blank image.", file=sys.stderr)
+        preview = Image.new("RGB", (512, 512), (128, 128, 128))
+
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "image", "image": preview},
+            {"type": "text",  "text":  _QWEN_PROMPT_QUESTION},
+        ],
+    }]
+
+    try:
+        text   = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=[text], images=[preview], return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            out_ids = model.generate(**inputs, max_new_tokens=128, do_sample=False)
+        generated = out_ids[0][inputs["input_ids"].shape[1]:]
+        result    = processor.decode(generated, skip_special_tokens=True).strip()
+        print(f"[qwen] Generated prompt: {result!r}")
+        return result
+    except Exception as e:
+        print(f"[qwen] ERROR during inference: {e}", file=sys.stderr)
+        return None
+    finally:
+        del model
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def _parse_args():
@@ -1511,6 +1713,10 @@ def _parse_args():
                    help="List known downloadable upscale models and exit")
     p.add_argument("--download-upscaler",   metavar="MODEL",
                    help="Download a known upscale model (use --list-upscalers to see names)")
+    p.add_argument("--list-checkpoints",    action="store_true",
+                   help="List known downloadable SDXL checkpoints and exit")
+    p.add_argument("--download-checkpoint", metavar="MODEL",
+                   help="Download a known SDXL checkpoint (use --list-checkpoints to see names)")
     p.add_argument("--comfyui-dir",         metavar="DIR",
                    default="",
                    help="Path to ComfyUI installation (used by --download-upscaler to "
@@ -1528,6 +1734,13 @@ def _parse_args():
                    help="Show camera placement GUI before generation (Enter=proceed, Esc=abort)")
     p.add_argument("--config",              metavar="FILE",
                    help="JSON config file; CLI args override config values")
+    p.add_argument("--qwen-prompt",         action="store_true",
+                   help="Auto-generate --prompt from mesh using Qwen VLM (ignores --prompt if set)")
+    p.add_argument("--qwen-model",          metavar="MODEL",
+                   default="qwen2.5-vl-7b",
+                   choices=list(_QWEN_MODELS.keys()),
+                   help="Qwen model for prompt generation (default: qwen2.5-vl-7b). "
+                        "Choices: " + ", ".join(_QWEN_MODELS.keys()))
     args = p.parse_args()
 
     # Apply config file: for each key in the JSON, use the config value only when
@@ -1573,6 +1786,25 @@ def main():
             print("[download] --comfyui-dir not set; saving to current directory")
             print("[download] Use --comfyui-dir <path> to save directly into ComfyUI")
         result = download_upscaler(args.download_upscaler, dest)
+        sys.exit(0 if result else 1)
+
+    if args.list_checkpoints:
+        print("\nKnown SDXL checkpoints (--download-checkpoint <name>):\n")
+        for name, info in _CHECKPOINT_MODELS.items():
+            print(f"  {name}")
+            print(f"    {info['desc']}  {info['size']}")
+            print(f"    {info['url']}")
+            print()
+        sys.exit(0)
+
+    if args.download_checkpoint:
+        if args.comfyui_dir:
+            dest = os.path.join(args.comfyui_dir, "models", "checkpoints")
+        else:
+            dest = "."
+            print("[download] --comfyui-dir not set; saving to current directory")
+            print("[download] Use --comfyui-dir <path> to save directly into ComfyUI")
+        result = download_checkpoint(args.download_checkpoint, dest)
         sys.exit(0 if result else 1)
 
     # Track which args were explicitly provided on the command line (not left as None/default).
@@ -1659,6 +1891,16 @@ def main():
             if key not in _explicit:
                 setattr(args, key, s[key])
                 print(f"[auto] {key}={s[key]}  ({s['reasons'].get(key, '')})")
+
+    # 2d. --qwen-prompt: auto-generate prompt via Qwen VLM
+    if args.qwen_prompt:
+        print(f"[qwen] Auto-generating prompt with {args.qwen_model} ...")
+        _qp = qwen_generate_prompt(mesh, model_key=args.qwen_model)
+        if _qp:
+            args.prompt = _qp
+        else:
+            print("[qwen] WARNING: prompt generation failed; using existing --prompt value.",
+                  file=sys.stderr)
 
     print(f"[standalone] -- StableGen standalone --")
     print(f"[standalone] Mesh      : {args.mesh}")

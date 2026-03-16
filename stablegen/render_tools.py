@@ -4714,6 +4714,8 @@ def bake_texture(context, obj, texture_resolution, suffix = "", view_transform =
         # Ensure OBJECT mode — bake fails silently in EDIT mode
         if bpy.context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.context.scene.render.bake.margin = 16
+        bpy.context.scene.render.bake.margin_type = 'EXTEND'
         bpy.ops.object.bake(type='DIFFUSE', width=texture_resolution, height=texture_resolution)
        
         # Save the image if required

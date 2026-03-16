@@ -50,7 +50,7 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
             GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_TEXTURE_MIN_FILTER,
             GL_TRIANGLES, GL_UNPACK_ALIGNMENT, GL_UNSIGNED_BYTE,
             glBegin, glBindTexture, glBlendFunc, glClear, glClearColor,
-            glColor4f, glDeleteTextures, glDisable, glEnable, glEnd,
+            glColor3f, glColor4f, glDeleteTextures, glDisable, glEnable, glEnd,
             glGenTextures, glLightfv, glLineWidth, glLoadIdentity, glMaterialfv,
             glMatrixMode, glNormal3fv, glOrtho, glPixelStorei,
             glPolygonOffset, glPopMatrix, glPushMatrix, glRotatef, glTexCoord2f,
@@ -90,12 +90,13 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
             _edge_count[key] = _edge_count.get(key, 0) + 1
     mesh_edges = np.array(list(_edge_count.keys()), dtype=np.int32)   # (E, 2)
 
-    # UV island boundary edges for the 2D inset: boundary edges (count==1) in UV space.
-    # Stored as pairs of UV pixel coords for fast drawing.
-    _uv_seam_pairs = []   # list of (uv_a, uv_b) float pairs in [0,1]
+    # UV island boundary edges: 2D inset pairs + 3D on-mesh pairs
+    _uv_seam_pairs = []   # (uv_a, uv_b) in [0,1] for 2D inset
+    _uv_seam_3d    = []   # (vert_a, vert_b) in normalised 3D space
     for (a, b), cnt in _edge_count.items():
         if cnt == 1:
             _uv_seam_pairs.append((uv_arr[a], uv_arr[b]))
+            _uv_seam_3d.append((verts[a], verts[b]))
 
     # ── Upload mesh texture ────────────────────────────────────────────────────
     # PIL row-0 = top; OpenGL row-0 = bottom → flip so UV v=0 is bottom.
@@ -484,60 +485,22 @@ def view_result(mesh, uv, texture_img, warnings=None, gen_images=None, coverage_
             glEnable(GL_LIGHTING)
             glEnable(GL_TEXTURE_2D)
 
-        # ── UV atlas inset (U) — 2D panel in top-right corner ────────────────
-        if show_uvs and _uv_seam_pairs:
-            INSET  = 220
-            MARGIN = 8
-            PAD    = 10
-            ix0 = W - INSET - PAD
-            iy0 = PAD
-
-            glDisable(GL_DEPTH_TEST)
-            glDisable(GL_LIGHTING)
+        # ── UV seam edges on mesh (U) ─────────────────────────────────────────
+        if show_uvs and _uv_seam_3d:
             glDisable(GL_TEXTURE_2D)
-            glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
-            glOrtho(0, W, H, 0, -1, 1)
-            glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity()
-            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-
-            # Dark background
-            glColor4f(0.05, 0.05, 0.05, 0.85)
-            glBegin(GL_QUADS)
-            glVertex2f(ix0,        iy0)
-            glVertex2f(ix0+INSET,  iy0)
-            glVertex2f(ix0+INSET,  iy0+INSET)
-            glVertex2f(ix0,        iy0+INSET)
-            glEnd()
-
-            # Border
-            glColor4f(0.5, 0.5, 0.5, 0.8)
-            glLineWidth(1.0)
-            glBegin(GL_LINE_LOOP)
-            glVertex2f(ix0,        iy0)
-            glVertex2f(ix0+INSET,  iy0)
-            glVertex2f(ix0+INSET,  iy0+INSET)
-            glVertex2f(ix0,        iy0+INSET)
-            glEnd()
-
-            # UV island boundary edges
-            inner = INSET - MARGIN * 2
-            glColor4f(1.0, 0.85, 0.1, 0.9)
+            glDisable(GL_LIGHTING)
+            glDisable(GL_DEPTH_TEST)
+            glColor3f(1.0, 0.85, 0.1)
             glLineWidth(1.5)
             glBegin(GL_LINES)
-            for uva, uvb in _uv_seam_pairs:
-                ua, va = float(uva[0]), float(uva[1])
-                ub, vb = float(uvb[0]), float(uvb[1])
-                glVertex2f(ix0 + MARGIN + ua * inner, iy0 + MARGIN + (1.0 - va) * inner)
-                glVertex2f(ix0 + MARGIN + ub * inner, iy0 + MARGIN + (1.0 - vb) * inner)
+            for va, vb in _uv_seam_3d:
+                glVertex3fv(va); glVertex3fv(vb)
             glEnd()
             glLineWidth(1.0)
-
-            glDisable(GL_BLEND)
-            glMatrixMode(GL_PROJECTION); glPopMatrix()
-            glMatrixMode(GL_MODELVIEW);  glPopMatrix()
             glEnable(GL_DEPTH_TEST)
             glEnable(GL_LIGHTING)
             glEnable(GL_TEXTURE_2D)
+
 
         # ── HUD overlay (rebuilt on mode change or each second for live FPS) ────
         new_fps = int(clock.get_fps())
@@ -1236,50 +1199,6 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None, texture
             glEnd()
             glLineWidth(1.0)
             glEnable(GL_DEPTH_TEST)
-
-        # ── UV seam inset ─────────────────────────────────────────────────────
-        if show_uvs and _cam_uv_seam_pairs:
-            INSET  = 220
-            MARGIN = 8
-            PAD    = 10
-            ix0 = W - INSET - PAD
-            iy0 = PAD
-
-            glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING); glDisable(GL_TEXTURE_2D)
-            glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
-            glOrtho(0, W, H, 0, -1, 1)
-            glMatrixMode(GL_MODELVIEW);  glPushMatrix(); glLoadIdentity()
-            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-
-            glColor4f(0.05, 0.05, 0.05, 0.85)
-            glBegin(GL_QUADS)
-            glVertex2f(ix0,       iy0);        glVertex2f(ix0+INSET, iy0)
-            glVertex2f(ix0+INSET, iy0+INSET);  glVertex2f(ix0,       iy0+INSET)
-            glEnd()
-
-            glColor4f(0.5, 0.5, 0.5, 0.8)
-            glLineWidth(1.0)
-            glBegin(GL_LINE_LOOP)
-            glVertex2f(ix0,       iy0);        glVertex2f(ix0+INSET, iy0)
-            glVertex2f(ix0+INSET, iy0+INSET);  glVertex2f(ix0,       iy0+INSET)
-            glEnd()
-
-            inner = INSET - MARGIN * 2
-            glColor4f(1.0, 0.85, 0.1, 0.9)
-            glLineWidth(1.5)
-            glBegin(GL_LINES)
-            for uva, uvb in _cam_uv_seam_pairs:
-                glVertex2f(ix0 + MARGIN + float(uva[0]) * inner,
-                           iy0 + MARGIN + (1.0 - float(uva[1])) * inner)
-                glVertex2f(ix0 + MARGIN + float(uvb[0]) * inner,
-                           iy0 + MARGIN + (1.0 - float(uvb[1])) * inner)
-            glEnd()
-            glLineWidth(1.0)
-
-            glDisable(GL_BLEND)
-            glMatrixMode(GL_PROJECTION); glPopMatrix()
-            glMatrixMode(GL_MODELVIEW);  glPopMatrix()
-            glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING)
 
         # ── HUD ───────────────────────────────────────────────────────────────
         new_fps = int(clock.get_fps())
