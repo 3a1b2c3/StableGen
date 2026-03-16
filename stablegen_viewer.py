@@ -740,9 +740,10 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None, texture
     face_cam, face_max = _recompute_coverage(cam_positions)
 
     # ── Interactive mode state ─────────────────────────────────────────────────
-    TAB_H  = 32
-    TAB_W  = 900 // max(len(_CAM_MODES), 1)   # pixels per mode tab
-    CTRL_W = 140                                # width of cam-count control area
+    TAB_H    = 32
+    TAB_W    = 900 // max(len(_CAM_MODES), 1)   # pixels per mode tab
+    CANCEL_W = 70                                # width of Cancel button
+    CTRL_W   = 140 + CANCEL_W                    # width of cam-count + cancel area
 
     mode_int = init_mode
     n_cams   = init_n if init_n is not None else len(cameras)
@@ -935,11 +936,38 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None, texture
             glDeleteTextures([t])
 
         mx_now, my_now = pygame.mouse.get_pos()
-        minus_hover = (cx0 <= mx_now < cx0 + BTN_W) and my_now >= VIEW_H
-        plus_hover  = (W - BTN_W <= mx_now < W)     and my_now >= VIEW_H
+        minus_hover  = (cx0 <= mx_now < cx0 + BTN_W)               and my_now >= VIEW_H
+        plus_hover   = (cx0 + BTN_W + mid_w <= mx_now < cx0 + BTN_W + mid_w + BTN_W) and my_now >= VIEW_H
+        cancel_hover = (W - CANCEL_W <= mx_now < W)                 and my_now >= VIEW_H
 
-        _btn(cx0,          "−", hover=minus_hover)
-        _btn(W - BTN_W,    "+", hover=plus_hover)
+        _btn(cx0,                        "−", hover=minus_hover)
+        _btn(cx0 + BTN_W + mid_w,        "+", hover=plus_hover)
+
+        # Cancel button
+        glDisable(GL_TEXTURE_2D)
+        cr, cg, cb = (0.75, 0.20, 0.20) if cancel_hover else (0.45, 0.12, 0.12)
+        glColor4f(cr, cg, cb, 1.0)
+        glBegin(GL_QUADS)
+        glVertex2f(W - CANCEL_W + 2, BAR_Y + 2)
+        glVertex2f(W - 2,            BAR_Y + 2)
+        glVertex2f(W - 2,            H - 2)
+        glVertex2f(W - CANCEL_W + 2, H - 2)
+        glEnd()
+        s = font_bold.render("✕ Cancel", True, (255, 200, 200))
+        t, tw, th = _surface_to_gl(s)
+        bx = W - CANCEL_W + (CANCEL_W - tw) // 2
+        by = BAR_Y + (TAB_H - th) // 2
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, t)
+        glColor4f(1, 1, 1, 1)
+        glBegin(GL_QUADS)
+        glTexCoord2f(0,1); glVertex2f(bx,      by)
+        glTexCoord2f(1,1); glVertex2f(bx + tw, by)
+        glTexCoord2f(1,0); glVertex2f(bx + tw, by + th)
+        glTexCoord2f(0,0); glVertex2f(bx,      by + th)
+        glEnd()
+        glDeleteTextures([t])
+        glDisable(GL_TEXTURE_2D)
 
         # Count label in the middle
         glDisable(GL_TEXTURE_2D)
@@ -996,7 +1024,7 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None, texture
              ON if cov_draw_mode != 0 else OFF),
             (font_sm, f"U  {uv_str}",
              ON if show_uvs else OFF),
-            (font_sm, "Enter/Space: proceed   Esc: abort   drag: orbit   scroll: zoom"
+            (font_sm, "Enter/Space: proceed   Esc/Cancel: abort   drag: orbit   scroll: zoom"
                       + ("   </>/Tab: mode   +/-: count" if build_fn else ""),
              DIM),
             (font_sm, "", (0, 0, 0)),
@@ -1087,7 +1115,9 @@ def view_cameras(mesh, cameras, build_fn=None, init_mode=5, init_n=None, texture
                     # Click on mode tab bar / count buttons?
                     if build_fn and my >= VIEW_H:
                         BTN_W = 28
-                        if mx >= W - BTN_W:               # [+]
+                        if mx >= W - CANCEL_W:                              # [Cancel]
+                            proceed = False; running = False
+                        elif mx >= W - CANCEL_W - BTN_W:                    # [+]
                             _rebuild(mode_idx, n_cams + 1); hud_tid = None
                         elif mx >= W - CTRL_W and mx < W - CTRL_W + BTN_W:  # [-]
                             _rebuild(mode_idx, n_cams - 1); hud_tid = None
