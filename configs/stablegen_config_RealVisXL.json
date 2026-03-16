@@ -1,6 +1,6 @@
 {
     "mesh": "C:/workspace/MODEL/data/BanhMi_Cart.usdz",
-    "prompt": "",
+    "prompt": "a worn street vendor cart",
     "negative": "",
     "cameras": 6,
     "camera_mode": 5,

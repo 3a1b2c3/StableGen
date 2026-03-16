@@ -29,5 +29,5 @@
     "auto": false,
     "qwen_prompt": false,
     "qwen_model": "qwen2.5-vl-7b",
-    "comfyui_dir": ""
+    "comfyui_dir": "C:/workspace/MODEL/ComfyUI"
 }
