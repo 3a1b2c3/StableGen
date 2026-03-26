@@ -23,6 +23,7 @@ StableGen is an open-source Blender addon that brings generative AI into your 3D
   - [Generating a 3D Model with TRELLIS.2](#generating-a-3d-model-with-trellis2)
 - [📖 Usage & Parameters Overview](#-usage--parameters-overview)
 - [📁 Output Directory Structure](#-output-directory-structure)
+- [🖥️ Command-Line Interface (No Blender Required)](#️-command-line-interface-no-blender-required)
 - [🤔 Troubleshooting](#-troubleshooting)
 - [🤝 Contributing](#-contributing)
 - [📜 License](#-license)
@@ -532,6 +533,174 @@ StableGen organizes the generated files within the `Output Directory` specified 
             * `.gif` / `.mp4` *(If the `Export  GIF/MP4` tool is used, these files are saved directly into the timestamped revision directory)*
             * `prompt.json` *(The last generated workflow to be used in ComfyUI)*
          
+---
+
+## 🖥️ Command-Line Interface (No Blender Required)
+
+Two standalone CLI tools are available that run without opening Blender.
+
+---
+
+### `stablegen_standalone.py` — Full texturing pipeline
+
+Loads a mesh, places cameras, generates images via ComfyUI, and bakes the result onto a UV texture atlas — **no Blender installation needed**.
+
+**Install dependencies** (once):
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install xatlas   # optional: proper UV unwrap if mesh has no UVs
+```
+
+> **Note:** If you have the `websocket` package installed (a WSGI server package), it shadows `websocket-client` and causes import errors. Fix with:
+> ```powershell
+> .\.venv\Scripts\python.exe -m pip uninstall websocket -y
+> ```
+
+**Check ComfyUI is reachable and list available checkpoints:**
+```powershell
+.\.venv\Scripts\python.exe stablegen_standalone.py --check
+```
+
+**Basic usage:**
+```powershell
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh sphere.obj --prompt "ancient stone wall with moss" --output ./out --server 127.0.0.1:8188
+```
+
+**Let the tool pick the best settings for your mesh:**
+```powershell
+# Print recommended command and exit
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --suggest
+
+# Apply recommended settings automatically
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --prompt "rusted metal" --auto
+```
+
+**More options:**
+```powershell
+# 8 cameras, K-means placement, save each camera render, open viewer after
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --prompt "rusted metal" `
+    --cameras 8 --camera-mode 5 --export glb --save-views --view
+
+# Preview camera placement GUI before generating (Enter = proceed, Esc = abort)
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --prompt "wood planks" `
+    --camera-gui
+
+# Upscale the final texture using a ComfyUI upscale model
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --prompt "marble" `
+    --upscale-result --upscale-model 4x-UltraSharp.pth
+
+# List available upscale models / download one into ComfyUI
+.\.venv\Scripts\python.exe stablegen_standalone.py --list-upscalers
+.\.venv\Scripts\python.exe stablegen_standalone.py --download-upscaler 4x-UltraSharp.pth `
+    --comfyui-dir "C:\ComfyUI"
+
+# Disable ControlNet depth (faster, txt2img only)
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --prompt "wood planks" `
+    --no-controlnet
+
+# Custom steps/CFG/seed
+.\.venv\Scripts\python.exe stablegen_standalone.py --mesh model.obj --prompt "marble" `
+    --steps 30 --cfg 7.5 --seed 42 --tex-size 2048
+```
+
+**All arguments:**
+
+| Argument | Default | Description |
+|---|---|---|
+| `--mesh FILE` | — | Input mesh (.obj, .glb, .stl) |
+| `--prompt TEXT` | `""` | Generation prompt |
+| `--negative TEXT` | `""` | Negative prompt |
+| `--checkpoint FILE` | `RealVisXL_V5.0_fp16.safetensors` | Checkpoint in ComfyUI models/checkpoints/ |
+| `--cameras N` | `6` | Number of cameras |
+| `--camera-mode 1-7` | `5` | Placement strategy (see table below) |
+| `--steps N` | `20` | Diffusion steps |
+| `--cfg F` | `7.0` | CFG scale |
+| `--seed N` | `-1` (random) | Seed |
+| `--width / --height N` | `1024` | Generated image resolution |
+| `--tex-size N` | `1024` | UV atlas resolution |
+| `--server ADDR` | `127.0.0.1:8188` | ComfyUI address |
+| `--output DIR` | `./sg_out` | Output directory |
+| `--export FORMAT` | `glb` | `glb` \| `obj` \| `none` |
+| `--no-controlnet` | off | Skip depth ControlNet (use plain txt2img) |
+| `--controlnet MODEL` | `control-lora-depth-rank128.safetensors` | ControlNet model |
+| `--controlnet-strength F` | `0.6` | ControlNet influence |
+| `--save-views` | off | Save each camera's generated image to output dir |
+| `--spherical-uv` | off | Force spherical UV (ignore mesh UVs) |
+| `--suggest` | off | Analyse mesh, print recommended settings, exit |
+| `--auto` | off | Apply estimated settings for any arg not explicitly set |
+| `--camera-gui` | off | Show camera placement GUI before generation |
+| `--view` | off | Open interactive 3D viewer after texturing completes |
+| `--upscale-result` | off | Upscale the final texture via ComfyUI |
+| `--upscale-model FILE` | `4x-UltraSharp.pth` | Upscale model in ComfyUI models/upscale_models/ |
+| `--list-upscalers` | off | List known upscale models with download info, exit |
+| `--download-upscaler FILE` | — | Download a known upscale model and exit |
+| `--comfyui-dir DIR` | — | ComfyUI root dir (for `--download-upscaler` placement) |
+| `--check` | off | Check ComfyUI connection and print server info, exit |
+
+**Camera placement modes:**
+
+| Mode | Strategy | Best for |
+|---|---|---|
+| `1` | Orbit ring | Tall, Z-symmetric objects (vases, columns) |
+| `2` | Fan arc | Objects with a clear dominant front face |
+| `3` | Fibonacci hemisphere | Convex objects needing even hemispherical coverage |
+| `4` | PCA axes | Elongated non-upright objects (weapons, vehicles) |
+| `5` | K-means normals *(default)* | General organic shapes |
+| `6` | Greedy coverage | Concave or heavily undercut meshes |
+| `7` | Visibility-weighted K-means | Meshes with large occluded areas |
+
+Use `--suggest` to let the tool pick the best mode automatically based on mesh geometry.
+
+**Output files** (all written to `--output` dir):
+
+| File | Written |
+|---|---|
+| `texture.png` | Always |
+| `textured_mesh.glb` / `.obj` | Always (unless `--export none`) |
+| `view_NN.png` | Only with `--save-views` |
+
+If `pyrender` is not installed, depth ControlNet is skipped automatically and plain txt2img is used. If `xatlas` is not installed and the mesh has no UVs, spherical UV mapping is used as fallback.
+
+---
+
+### `stablegen_cli.py` — Headless Blender pipeline
+
+Runs the full StableGen addon pipeline inside Blender without opening the GUI. Requires Blender 4.2–4.5 or 5.1+ with the StableGen addon installed.
+
+```powershell
+& "C:\Program Files\Blender Foundation\Blender 4.2\blender.exe" `
+    --background --python stablegen_cli.py -- `
+    --mesh sphere.obj `
+    --prompt "ancient stone wall with moss" `
+    --output ./out `
+    --server 127.0.0.1:8188
+```
+
+With baking and GLB export:
+```powershell
+& "C:\Program Files\Blender Foundation\Blender 4.2\blender.exe" `
+    --background --python stablegen_cli.py -- `
+    --mesh model.obj --prompt "rusted metal surface" `
+    --output ./out --server 127.0.0.1:8188 --bake --export glb
+```
+
+---
+
+### `camera_placement_cli.py` — Camera placement preview
+
+Preview camera directions for any mesh without Blender or ComfyUI.
+
+```bash
+python camera_placement_cli.py mesh.obj 5 --cameras 6              # K-means, pretty table
+python camera_placement_cli.py mesh.obj 1 --cameras 8 --elevation 20  # Orbit ring
+python camera_placement_cli.py mesh.obj 5 --cameras 6 --output csv    # CSV output
+python camera_placement_cli.py mesh.obj 6 --cameras 8 --coverage 0.90 # Greedy coverage
+python camera_placement_cli.py mesh.obj 7 --cameras 6 --balance 0.3   # Visibility-weighted
+python camera_placement_cli.py mesh.obj 5 --gui                        # pygame visualizer
+```
+
+Modes: `1` Orbit Ring · `2` Fan Arc · `3` Hemisphere · `4` PCA Axes · `5` K-means · `6` Greedy · `7` Visibility-Weighted
+
 ---
 
 ## 🤔 Troubleshooting
